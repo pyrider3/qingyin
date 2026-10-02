@@ -1,0 +1,22 @@
+# Local runtimes and generated binaries
+.venv/
+target/
+__pycache__/
+*.py[cod]
+*.so
+
+# Models, recordings, personal settings and local backups
+backups/
+models/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.bin
+*.safetensors
+config.json
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

@@ -1,0 +1,30 @@
+name: Checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable
+      - name: Format, lint and build
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release --locked
+      - name: Local text conversion and controller tests
+        run: |
+          python -m pip install opencc-python-reimplemented==0.1.7
+          python -m compileall -q python tests install.py uninstall.py
+          python tests/normalize.py
+          python tests/lifecycle.py
+      - name: Build fcitx5 addon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ pkg-config libfcitx5core-dev libfcitx5utils-dev
+          c++ -shared -fPIC -std=c++20 fcitx/qingyin.cpp -o /tmp/libqingyin.so $(pkg-config --cflags --libs Fcitx5Core Fcitx5Utils)
