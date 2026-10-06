@@ -25,3 +25,5 @@ PyYAML==6.0.3
 tokenizers==0.23.2
 tqdm==4.70.1
 typing_extensions==4.16.0
+sherpa-onnx==1.13.8
+sherpa-onnx-core==1.13.8

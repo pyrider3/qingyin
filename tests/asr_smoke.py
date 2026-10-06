@@ -4,7 +4,7 @@ import subprocess, os, json, tempfile, wave, sys
 root=Path(__file__).resolve().parents[1]
 site=next((root/'.venv/lib').glob('python*/site-packages'))
 env={**os.environ,'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1',
-     'LD_LIBRARY_PATH':':'.join(str(site/'nvidia'/lib/'lib') for lib in ('cublas','cudnn','cuda_nvrtc'))}
+     'LD_LIBRARY_PATH':':'.join(str(lib) for lib in site.glob('nvidia/*/lib'))}
 config=json.loads((Path.home()/'.config/qingyin/config.json').read_text())
 p=subprocess.Popen([root/'.venv/bin/python',root/'python/asr.py',config['model'],'cuda','float16'],
                    env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)

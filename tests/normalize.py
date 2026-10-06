@@ -14,3 +14,16 @@ for source,expected in cases.items():
  assert result==expected,(source,result,expected)
  assert simplified(result)==result
 print('PASS: Traditional Chinese, phrase conversion, Simplified idempotence and mixed English')
+
+from normalize import without_final_period
+for source, expected in {
+    '你好。': '你好',
+    '你好。今天天气不错。': '你好。今天天气不错',
+    '可以吗？': '可以吗？',
+    '谢谢！': '谢谢！',
+    '你好。  ': '你好  ',
+    '配置 config.kdl': '配置 config.kdl',
+    '': '',
+}.items():
+    assert without_final_period(source) == expected
+print('PASS: final full stop omitted; sentence punctuation, questions and filenames preserved')

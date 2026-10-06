@@ -19,7 +19,7 @@ addon.write_text((root/'fcitx/qingyin.conf').read_text().replace('Library=libqin
 config=home/'.config/qingyin/config.json'
 config.parent.mkdir(parents=True,exist_ok=True)
 if not config.exists():
- config.write_text(json.dumps({'model':str(share/'models/large-v3'),'device':'cuda','language':'zh','auto_input':True,'microphone':None,'max_seconds':300,'show_panel':False,'compute_type':'float16','beam_size':5,'hotwords':''},ensure_ascii=False,indent=2)+'\n')
+ config.write_text(json.dumps({'model':str(share/'models/large-v3'),'device':'cuda','language':'zh','auto_input':True,'microphone':None,'max_seconds':300,'show_panel':False,'compute_type':'float16','beam_size':5,'hotwords':'','punctuation':True,'learning':True},ensure_ascii=False,indent=2)+'\n')
 launcher=home/'.local/bin/qingyin'
 launcher.parent.mkdir(parents=True,exist_ok=True)
 site=next((root/'.venv/lib').glob('python*/site-packages'))
@@ -27,7 +27,7 @@ launcher.write_text(f'''#!/bin/sh
 export QINGYIN_HOME='{root}'
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export LD_LIBRARY_PATH='{site}/nvidia/cublas/lib:{site}/nvidia/cudnn/lib:{site}/nvidia/cuda_nvrtc/lib'${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
+export LD_LIBRARY_PATH='{site}/nvidia/cublas/lib:{site}/nvidia/cudnn/lib:{site}/nvidia/cuda_nvrtc/lib:{site}/nvidia/cuda_runtime/lib:{site}/nvidia/cufft/lib:{site}/nvidia/curand/lib:{site}/nvidia/nvjitlink/lib'${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
 exec '{root}/target/release/qingyin' "$@"
 ''')
 launcher.chmod(0o755)
@@ -58,11 +58,28 @@ Exec={launcher} toggle
 Icon=audio-input-microphone
 Categories=Utility;Audio;
 Terminal=false
-Actions=Settings;
+Actions=Settings;Edit;Vocabulary;
 
 [Desktop Action Settings]
 Name=设置
 Exec={launcher} settings
+
+[Desktop Action Edit]
+Name=纠正上一条结果
+Exec={launcher} edit
+
+[Desktop Action Vocabulary]
+Name=个人词库
+Exec={launcher} vocabulary
+''')
+(desktop.parent/'qingyin-settings.desktop').write_text(f'''[Desktop Entry]
+Type=Application
+Name=青音设置
+Comment=选择识别显卡、模型和文字输出方式
+Exec={launcher} settings
+Icon=audio-input-microphone
+Categories=Settings;Audio;
+Terminal=false
 ''')
 niri=home/'.config/niri/config.kdl'
 s=niri.read_text()
@@ -72,6 +89,7 @@ if 'Qingyin local dictation' not in s:
  s=s.replace('binds {',f'''binds {{
     // Qingyin local dictation: press once to start, once to stop.
     Mod+A repeat=false {{ spawn "{launcher}" "toggle"; }}
+    Mod+Alt+A repeat=false {{ spawn "{launcher}" "edit"; }}
     Mod+Alt+Escape repeat=false {{ spawn "{launcher}" "cancel"; }}''',1)
  s+='''
 // Qingyin preview must not steal the text field's focus.

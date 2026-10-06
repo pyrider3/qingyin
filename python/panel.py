@@ -31,10 +31,11 @@ class Panel(Gtk.Application):
         self.text.set_max_width_chars(56)
         box.append(self.text)
         self.buttons = Gtk.Box(spacing=10)
-        for label, action in [('复制', 'copy'), ('取消 / 关闭', 'cancel')]:
+        for label, action in [('复制', 'copy'), ('纠正并学习', 'edit'), ('取消 / 关闭', 'cancel')]:
             button = Gtk.Button(label=label)
             button.connect('clicked', lambda _, a=action: subprocess.Popen([cli, a]))
             self.buttons.append(button)
+            if action == 'edit': self.edit_button = button
             if action == 'copy': self.copy_button = button
         box.append(self.buttons)
         self.window.set_child(box)
@@ -84,6 +85,7 @@ class Panel(Gtk.Application):
         self.wave.queue_draw()
         self.buttons.set_visible(phase in ('result', 'error', 'recording'))
         self.copy_button.set_visible(phase == 'result' and bool(data.get('text')))
+        self.edit_button.set_visible(phase == 'result' and bool(data.get('text')))
         if not self.window.get_visible(): self.window.set_visible(True)
         return True
 Panel().run([])

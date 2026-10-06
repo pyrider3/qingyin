@@ -32,6 +32,13 @@ struct Config {
     beam_size: u32,
     #[serde(default)]
     hotwords: String,
+    #[serde(default = "default_punctuation")]
+    punctuation: bool,
+    #[serde(default = "default_punctuation")]
+    learning: bool,
+}
+fn default_punctuation() -> bool {
+    true
 }
 fn default_compute() -> String {
     "float16".into()
@@ -50,6 +57,41 @@ enum Event {
     Ready,
     Result(io::Result<String>),
 }
+fn chinese_error(error: &io::Error) -> String {
+    let raw = error.to_string();
+    eprintln!("青音错误详情：{raw}");
+    let lower = raw.to_lowercase();
+    if lower.contains("out of memory") || lower.contains("显存不足") {
+        return "显存不足，无法加载或运行识别模型。请关闭其他占用显存的软件，或在青音设置中将识别设备改为 CPU。".into();
+    }
+    if lower.contains("cuda") || lower.contains("cudnn") || lower.contains("cublas") {
+        return "显卡识别引擎不可用，请检查 NVIDIA 驱动，或在青音设置中改用 CPU。".into();
+    }
+    if error.kind() == io::ErrorKind::NotFound || lower.contains("no such file") {
+        return "所需文件或程序不存在，请检查模型路径和青音安装是否完整。".into();
+    }
+    if error.kind() == io::ErrorKind::PermissionDenied || lower.contains("permission denied") {
+        return "没有访问权限，请检查相关文件或设备的权限。".into();
+    }
+    if raw.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return raw;
+    }
+    "程序运行遇到错误，请重试。详细原因已记录在青音日志中。".into()
+}
+fn worker_reply(output: &mut impl BufRead) -> io::Result<Value> {
+    let mut line = String::new();
+    if output.read_line(&mut line)? == 0 {
+        return Err(io::Error::other(
+            "识别进程意外退出，请检查模型和运行环境；详细原因见青音日志。",
+        ));
+    }
+    let value: Value = serde_json::from_str(&line)
+        .map_err(|_| io::Error::other("识别进程返回了无效数据，请重试；详细原因见青音日志。"))?;
+    if let Some(error) = value["error"].as_str() {
+        return Err(io::Error::other(error.to_owned()));
+    }
+    Ok(value)
+}
 struct Worker {
     child: Child,
     job: Option<Sender<PathBuf>>,
@@ -57,7 +99,7 @@ struct Worker {
     reader: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    fn new(home: &Path, cfg: &Config) -> io::Result<Self> {
+    fn new(home: &Path, cfg: &Config, context: String) -> io::Result<Self> {
         let mut child = Command::new(home.join(".venv/bin/python"))
             .arg(home.join("python/asr.py"))
             .arg(&cfg.model)
@@ -80,9 +122,7 @@ impl Worker {
         let c = cfg.clone();
         let reader = thread::spawn(move || {
             let result = (|| -> io::Result<String> {
-                let mut line = String::new();
-                output.read_line(&mut line)?;
-                let v: Value = serde_json::from_str(&line).map_err(io::Error::other)?;
+                let v = worker_reply(&mut output)?;
                 if v["ready"] != true {
                     return Err(io::Error::other("本地模型未就绪"));
                 }
@@ -92,15 +132,10 @@ impl Worker {
                 writeln!(
                     input,
                     "{}",
-                    json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords})
+                    json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"punctuation":c.punctuation,"learning":c.learning,"context":context})
                 )?;
                 input.flush()?;
-                line.clear();
-                output.read_line(&mut line)?;
-                let v: Value = serde_json::from_str(&line).map_err(io::Error::other)?;
-                if let Some(e) = v["error"].as_str() {
-                    return Err(io::Error::other(e));
-                }
+                let v = worker_reply(&mut output)?;
                 v["text"]
                     .as_str()
                     .map(str::to_owned)
@@ -188,22 +223,75 @@ fn clipboard(text: &str) -> io::Result<()> {
     }
     Ok(())
 }
-fn commit(text: &str, rt: &Path) -> io::Result<bool> {
+fn commit(text: &str, rt: &Path, event: Option<f64>) -> io::Result<()> {
     let local = rt.join("commit.sock");
     let _ = fs::remove_file(&local);
     let sock = UnixDatagram::bind(&local)?;
     sock.set_read_timeout(Some(Duration::from_millis(800)))?;
     let result = (|| {
+        let payload = match event {
+            Some(event) => format!("\u{1f}qingyin:learn:{event}\n{text}"),
+            None => text.to_owned(),
+        };
         sock.send_to(
-            text.as_bytes(),
+            payload.as_bytes(),
             rt.parent().unwrap().join("qingyin-fcitx.sock"),
         )?;
         let mut buf = [0; 32];
         let n = sock.recv(&mut buf)?;
-        Ok(&buf[..n] == b"ok")
+        match &buf[..n] {
+            b"ok" => Ok(()),
+            b"sensitive" => Err(io::Error::other("当前是密码或敏感输入框，已跳过自动输入")),
+            _ => Err(io::Error::other("输入法未连接当前文本框，请先点击输入框")),
+        }
     })();
     let _ = fs::remove_file(local);
     result
+}
+fn context_snapshot(rt: &Path) -> io::Result<Value> {
+    let path = rt.join("context.sock");
+    let _ = fs::remove_file(&path);
+    let sock = UnixDatagram::bind(&path)?;
+    sock.set_read_timeout(Some(Duration::from_millis(250)))?;
+    let result = (|| {
+        sock.send_to(
+            b"\x1fqingyin:context",
+            rt.parent().unwrap().join("qingyin-fcitx.sock"),
+        )?;
+        let mut buffer = [0; 16384];
+        let n = sock.recv(&mut buffer)?;
+        let value: Value = serde_json::from_slice(&buffer[..n]).map_err(io::Error::other)?;
+        Ok(value)
+    })();
+    let _ = fs::remove_file(path);
+    result
+}
+fn start_context_watch(home: &Path) {
+    // Separate bounded service: ASR still exits immediately after recognition.
+    let _ = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--collect",
+            "--quiet",
+            "--unit=qingyin-learning",
+            "--service-type=exec",
+            "--property=RuntimeMaxSec=75",
+            "--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+            "/usr/bin/python3",
+        ])
+        .arg(home.join("python/context_watch.py"))
+        .output();
+}
+fn cancel_context_watch() {
+    if let Ok(socket) = UnixDatagram::unbound() {
+        let _ = socket.send_to(
+            b"\x1fqingyin:cancel-watch",
+            runtime().parent().unwrap().join("qingyin-fcitx.sock"),
+        );
+    }
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "qingyin-learning.service"])
+        .output();
 }
 fn stop_record(child: &mut Child) {
     let _ = Command::new("kill")
@@ -361,6 +449,7 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
     let path = rt.join("state.json");
     let state = Arc::new(Mutex::new(idle_state()));
     let target = focused();
+    let mut target_context = String::new();
     // Record before model initialization so speech at the first key press is preserved.
     let startup = (|| -> io::Result<()> {
         session.recorder = Some(start_record(&cfg, &rt.join("recording.wav"))?);
@@ -371,12 +460,25 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
             "再按 Win+A 停止 · Win+Alt+Esc 取消",
             "",
         );
-        session.worker = Some(Worker::new(&home, &cfg)?);
+        let context = if cfg.learning {
+            let snapshot = context_snapshot(&rt).unwrap_or(Value::Null);
+            target_context = snapshot["token"].as_str().unwrap_or("").to_owned();
+            snapshot["text"].as_str().unwrap_or("").to_owned()
+        } else {
+            String::new()
+        };
+        session.worker = Some(Worker::new(&home, &cfg, context)?);
         Ok(())
     })();
     if let Err(e) = startup {
-        set_state(&state, &path, "error", &format!("启动失败：{e}"), "");
-        notify(&format!("启动失败：{e}"));
+        set_state(
+            &state,
+            &path,
+            "error",
+            &format!("启动失败：{}", chinese_error(&e)),
+            "",
+        );
+        notify(&format!("启动失败：{}", chinese_error(&e)));
         return Ok(());
     }
     if cfg.show_panel {
@@ -396,7 +498,7 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                     "status" => status_json(&state.lock().unwrap(), true),
                     "toggle" if session.recorder.is_some() => {
                         if let Err(e) = stop_and_transcribe(&mut session, &state, &path) {
-                            set_state(&state, &path, "error", &e.to_string(), "");
+                            set_state(&state, &path, "error", &chinese_error(&e), "");
                             exit = true;
                         }
                         "正在转写".into()
@@ -439,26 +541,58 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                     }
                 }
                 Ok(text) => {
-                    let inserted = cfg.auto_input
-                        && target.is_some()
-                        && focused() == target
-                        && commit(&text, &rt).unwrap_or(false);
-                    let message = if inserted {
-                        "已输入当前文本框 · 录音已删除"
+                    let delivery = if !cfg.auto_input {
+                        Err("设置中已关闭自动输入".to_owned())
+                    } else if target.is_none() || focused() != target {
+                        Err("窗口焦点已改变，为避免输入到其他窗口，已保留结果".to_owned())
                     } else {
-                        "结果已保留，点击复制后粘贴 · 录音已删除"
+                        commit(
+                            &text,
+                            &rt,
+                            cfg.learning.then(|| state.lock().unwrap().started),
+                        )
+                        .map_err(|e| {
+                            eprintln!("自动输入失败：{e}");
+                            match e.kind() {
+                                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                                    "输入法连接不可用，请重启 fcitx5 后重试".to_owned()
+                                }
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                                    "输入法没有及时响应，请重试".to_owned()
+                                }
+                                _ => chinese_error(&e),
+                            }
+                        })
                     };
-                    set_state(&state, &path, "result", message, &text);
-                    if !inserted && !cfg.show_panel {
-                        notify(
-                            "未能自动输入。结果已保留：运行 qingyin show 查看，或 qingyin copy 后粘贴。",
-                        );
-                    }
+                    let message = match delivery {
+                        Ok(()) => {
+                            if cfg.learning {
+                                start_context_watch(&home);
+                            }
+                            "已输入当前文本框 · 录音已删除".to_owned()
+                        }
+                        Err(reason) => {
+                            eprintln!("青音自动输入：{reason}");
+                            let message =
+                                format!("{reason}。结果已保留，运行 qingyin copy 后粘贴。");
+                            if !cfg.show_panel {
+                                notify(&message);
+                            }
+                            message
+                        }
+                    };
+                    set_state(&state, &path, "result", &message, &text);
                 }
                 Err(e) => {
-                    set_state(&state, &path, "error", &format!("识别失败：{e}"), "");
+                    set_state(
+                        &state,
+                        &path,
+                        "error",
+                        &format!("识别失败：{}", chinese_error(&e)),
+                        "",
+                    );
                     if !cfg.show_panel {
-                        notify(&format!("识别失败：{e}"));
+                        notify(&format!("识别失败：{}", chinese_error(&e)));
                     }
                 }
             }
@@ -472,7 +606,7 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
             }
             let expired = now() - state.lock().unwrap().started >= cfg.max_seconds as f64;
             if expired && let Err(e) = stop_and_transcribe(&mut session, &state, &path) {
-                set_state(&state, &path, "error", &e.to_string(), "");
+                set_state(&state, &path, "error", &chinese_error(&e), "");
                 return Ok(());
             }
         }
@@ -516,14 +650,28 @@ fn toggle() -> io::Result<String> {
         "启动超时，请查看 journalctl --user -u qingyin",
     ))
 }
-fn main() -> io::Result<()> {
+fn run() -> io::Result<()> {
     let home = PathBuf::from(
         env::var("QINGYIN_HOME").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into()),
     );
     let cfg_path = PathBuf::from(env::var("HOME").unwrap()).join(".config/qingyin/config.json");
     let args: Vec<String> = env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("toggle");
+    if matches!(cmd, "cancel" | "quit") {
+        cancel_context_watch();
+    }
     let reply = match cmd {
+        "edit" | "vocabulary" => {
+            let mut editor = Command::new("/usr/bin/python3");
+            editor
+                .env("GDK_BACKEND", "wayland")
+                .arg(home.join("python/editor.py"));
+            if cmd == "vocabulary" {
+                editor.arg("--vocabulary");
+            }
+            editor.spawn()?;
+            "已打开纠正 / 个人词库窗口".into()
+        }
         "settings" => {
             Command::new("/usr/bin/python3")
                 .env("GDK_BACKEND", "wayland")
@@ -578,4 +726,30 @@ fn main() -> io::Result<()> {
     };
     println!("{}", reply.trim());
     Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("青音：{}", chinese_error(&error));
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn model_startup_errors_reach_chinese_message() {
+        let mut reply = io::Cursor::new(b"{\"error\":\"CUDA failed with error out of memory\"}\n");
+        let error = worker_reply(&mut reply).unwrap_err();
+        assert!(chinese_error(&error).starts_with("显存不足"));
+    }
+    #[test]
+    fn exited_worker_and_bad_json_are_readable() {
+        for bytes in [b"".as_slice(), b"invalid\n".as_slice()] {
+            let error = worker_reply(&mut io::Cursor::new(bytes)).unwrap_err();
+            assert!(chinese_error(&error).contains("识别进程"));
+        }
+        assert!(chinese_error(&io::Error::other("unknown backend exception")).contains("日志"));
+    }
 }

@@ -14,7 +14,11 @@
 - faster-whisper / CTranslate2 本地推理，支持 CUDA FP16 和 CPU INT8。
 - 通过 OpenCC 将识别结果统一转换为简体中文，保留英文。
 - fcitx5 插件向原应用提交文字；切换了焦点或输入框不兼容时保留结果供复制。
-- 可选 GTK4 悬浮预览、麦克风选择和识别热词。悬浮窗默认关闭。
+- 深色圆角 GTK4 控制中心：选择具体显卡 / CPU、本地模型、麦克风和文字输出方式。
+- CUDA 显卡 UUID 固定与加载前显存检查；显卡不可用或显存不足时停止加载。
+- CPU 本地补标点、简体输出，末尾不追加句号。
+- 输入框上下文提示与个人词库自动学习，支持查看、删除学习记录。
+- 可选悬浮预览默认关闭。
 
 ## 安装（Arch Linux）
 
@@ -51,6 +55,14 @@ uv pip install --python .venv/bin/python -r requirements.lock
 
 模型权重约 3.1 GB。也可下载兼容的 faster-whisper 模型到同级目录，在青音设置里切换。模型不包含在本仓库中，其许可证以模型提供方说明为准。
 
+补标点模型使用 CPU，只有转写时加载，结束后释放；不自动换段；转写结果末尾省略中文句号，句中标点和问号保留。首次安装还需下载约 62 MB 的标点模型：
+
+```bash
+python3 download_punctuation.py
+```
+
+下载脚本校验固定 SHA256。CPU 标点不占用显存。标点引擎在独立子进程运行，隔离 Whisper 静音检测与标点引擎的 ONNX 运行库；取消识别时子进程随之退出。模型来自 [sherpa-onnx 的 CT-Transformer 发布页](https://github.com/k2-fsa/sherpa-onnx/releases/tag/punctuation-models)，权重不随仓库分发。缺少模型或标点处理失败时保留原转写，具体原因写入日志。
+
 ### 4. 编译并安装
 
 ```bash
@@ -85,7 +97,7 @@ qingyin settings
 
 配置文件为 `~/.config/qingyin/config.json`。新安装默认使用系统麦克风；可在设置中固定音源，避免蓝牙连接改变录音设备。热词适合填写人名、软件名、专业词，用逗号分隔；它是识别提示，不是强制替换。
 
-设置中的 `max_seconds` 默认 300，超时自动停止并转写。`show_panel` 默认 `false`。查看结果、复制或打开设置不会加载识别模型。
+设置中的 `max_seconds` 默认 300，超时自动停止并转写。`show_panel` 默认 `false`；`punctuation` 默认 `true`，可在设置中关闭“自动补标点（不换段）”。查看结果、复制或打开设置不会加载识别模型。
 
 ## 离线与隐私
 
@@ -145,3 +157,36 @@ python3 uninstall.py
 ## 致谢
 
 基于 [faster-whisper](https://github.com/SYSTRAN/faster-whisper)、[CTranslate2](https://github.com/OpenNMT/CTranslate2)、[OpenCC](https://github.com/BYVoid/OpenCC) 的 Python 实现、[fcitx5](https://github.com/fcitx/fcitx5)、[niri](https://github.com/YaLTeR/niri)、PipeWire 和 GTK4。
+
+已下载标点模型后，可用 `.venv/bin/python tests/punctuation.py --model` 验证 CPU 本地补标点和原文保护。
+
+`python3 tests/punctuation_isolation.py` 验证取消后子进程退出；加入 `--model`（需要已安装 GPU 依赖和 JFK 样本）可验证真实 CUDA 识别和静音检测后连续三次 CPU 补标点，防止运行库冲突回归。
+
+
+## 上下文与自动学习
+
+默认开启完全本地的上下文辅助和自动学习：录音开始时从当前输入框获取光标附近最多 1024 字符，在本次识别中作为提示；不会上传或写入日志。输入后，在支持 fcitx5 surrounding-text 的应用中，只跟踪青音刚输入的那一段，观察你在原文本框里做的短词纠正，不必另外打开编辑器。
+
+观察进程不加载语音或标点模型，单次观察约 60 秒，改变文本框焦点、整段删除、取消、关闭学习或超时后停止。词语修改稳定约 1.5 秒后提取候选；按回车前已完成的纠正也可确认，而发送后的清空、继续追加文字、标点修改和大段改写不会成为词语纠正。密码 / 敏感输入框不读取上下文、不学习。
+
+首次纠正形成候选热词；同一规则在三次不同录音中确认后才自动替换。同一结果重复确认不重复计数。相同错误写法存在多个纠正目标时暂停自动替换；只做一次替换，不连锁改写。
+
+部分应用不提供输入法周围文本，或只提供变化的文本片段；此时不会强行读取其他应用或屏幕。语音输入正常工作，自动学习可能无法启用。`Win+Alt+A` / `qingyin edit` 的手动纠正保留为备用入口。
+
+`qingyin vocabulary`（或设置里的“查看 / 删除学习记录”）可以删除单条或清空全部记录。“上下文与自动学习”开关同时控制上下文提示、观察、学习热词与自动纠错。词库位于 `~/.local/share/qingyin/private/learning.json`，只保存短词对、次数及用于去重的录音时间标识；目录权限 0700，文件权限 0600，不上传，不保存整段文字或录音。
+
+`python3 tests/context_learning.py` / `python3 tests/learning.py` 验证提取、确认和词库规则；在本地 Wayland 会话中可用 `GDK_BACKEND=wayland /usr/bin/python3 tests/surrounding_live.py` 验证真实 fcitx5/GTK 上下文、自动观察、隐私排除与清空停止（使用合成文本和临时词库）。
+
+## CUDA 显卡与加载保护
+
+青音在导入 CUDA 识别库前通过 `nvidia-smi` 检查显卡状态，默认选择总显存最大的可见显卡。可在 `~/.config/qingyin/config.json` 设置 `gpu_uuid` 固定物理显卡（使用 `nvidia-smi --query-gpu=uuid,name --format=csv` 查看），避免编号随外接显卡、虚拟机直通或重启改变。设置界面保存时保留该字段。
+
+`gpu_min_free_mib` 默认 6144，最低也要求 6144 MiB 可用显存。指定显卡不存在、不在 `CUDA_VISIBLE_DEVICES` 允许范围、查询失败 / 超时或可用显存不足时，返回中文错误并停止加载，不自动落到另一张显卡。可在设置中手动选择 CPU，CPU 模式跳过 CUDA 检查。
+
+这是加载前的余量检查，不是显存预留，其他进程仍可能在检查后占用显存；也不能修复驱动、PCIe、虚拟机直通或内核故障。驱动异常时应避免反复重试 CUDA。`python tests/gpu_policy.py` 使用模拟显卡验证保护，不执行真实 CUDA 模型加载。
+
+## 图形控制中心
+
+在应用启动器搜索 **青音设置**，或执行 `qingyin settings`。深色控制中心分为识别引擎、输出与学习、输入与快捷键三个页面，可选择 CPU / 具体 NVIDIA 显卡（按 UUID 保存）、已安装模型、解码精度、麦克风、识别语言、补标点、自动输入、自动学习和悬浮预览。刷新设备显示最新空闲显存。更改需要点击保存，下次录音生效；识别进行中禁止保存。缺失的已选设备不会悄悄切换，未安装的模型不能保存。模型和显存保护逻辑均不因打开界面而执行 CUDA 加载。
+
+可用 `GDK_BACKEND=wayland /usr/bin/python3 tests/settings_ui.py` 在本地桌面验证设置映射与保存（临时配置、模拟显卡，不执行 CUDA）。
