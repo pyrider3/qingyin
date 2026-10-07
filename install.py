@@ -48,6 +48,19 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 ''')
+(unit.parent/'qingyin-model.service').write_text(f'''[Unit]
+Description=Qingyin resident offline model
+PartOf=graphical-session.target
+[Service]
+Type=simple
+ExecStart={launcher} model-server
+Restart=no
+TimeoutStopSec=5
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+''')
 desktop=home/'.local/share/applications/qingyin.desktop'
 desktop.parent.mkdir(parents=True,exist_ok=True)
 desktop.write_text(f'''[Desktop Entry]

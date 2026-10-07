@@ -27,6 +27,8 @@ jobs:
           python tests/context_learning.py
           python tests/asr_context.py
           python tests/gpu_policy.py
+          python tests/model_download.py
+          python tests/resident.py
           python tests/punctuation_isolation.py
           python tests/lifecycle.py
       - name: Build fcitx5 addon

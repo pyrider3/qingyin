@@ -56,3 +56,8 @@ for line in sys.stdin:
     except Exception as exc:
         print(f"转写失败：{exc}", file=sys.stderr, flush=True)
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), flush=True)
+
+    finally:
+        # Residency retains weights only, not the last recording or input context.
+        for key in ('request','audio','samples','vocabulary','hotwords','context','segments','info','text','line'):
+            globals().pop(key, None)

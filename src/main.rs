@@ -18,6 +18,8 @@ use std::{
 };
 #[derive(Clone, Deserialize, Serialize)]
 struct Config {
+    #[serde(default)]
+    resident_model: bool,
     model: String,
     device: String,
     language: String,
@@ -101,7 +103,11 @@ struct Worker {
 impl Worker {
     fn new(home: &Path, cfg: &Config, context: String) -> io::Result<Self> {
         let mut child = Command::new(home.join(".venv/bin/python"))
-            .arg(home.join("python/asr.py"))
+            .arg(home.join(if cfg.resident_model {
+                "python/resident.py"
+            } else {
+                "python/asr.py"
+            }))
             .arg(&cfg.model)
             .arg(&cfg.device)
             .arg(if cfg.device == "cpu" {
@@ -207,6 +213,20 @@ fn focused() -> Option<u64> {
         .find(|w| w["is_focused"] == true)?
         .get("id")?
         .as_u64()
+}
+fn same_input_target(
+    original_window: Option<u64>,
+    current_window: Option<u64>,
+    original_context: &str,
+    current_context: &str,
+) -> bool {
+    if !original_context.is_empty() {
+        // Layer-shell launchers are not normal niri windows. The focused fcitx
+        // input context identifies their text field without weakening protection.
+        original_context == current_context
+    } else {
+        original_window.is_some() && original_window == current_window
+    }
 }
 fn clipboard(text: &str) -> io::Result<()> {
     let exe = env::var("HOME").unwrap() + "/.local/bin/wl-copy";
@@ -460,9 +480,9 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
             "再按 Win+A 停止 · Win+Alt+Esc 取消",
             "",
         );
+        let snapshot = context_snapshot(&rt).unwrap_or(Value::Null);
+        target_context = snapshot["token"].as_str().unwrap_or("").to_owned();
         let context = if cfg.learning {
-            let snapshot = context_snapshot(&rt).unwrap_or(Value::Null);
-            target_context = snapshot["token"].as_str().unwrap_or("").to_owned();
             snapshot["text"].as_str().unwrap_or("").to_owned()
         } else {
             String::new()
@@ -543,8 +563,15 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                 Ok(text) => {
                     let delivery = if !cfg.auto_input {
                         Err("设置中已关闭自动输入".to_owned())
-                    } else if target.is_none() || focused() != target {
-                        Err("窗口焦点已改变，为避免输入到其他窗口，已保留结果".to_owned())
+                    } else if !same_input_target(
+                        target,
+                        focused(),
+                        &target_context,
+                        context_snapshot(&rt).unwrap_or(Value::Null)["token"]
+                            .as_str()
+                            .unwrap_or(""),
+                    ) {
+                        Err("输入焦点已改变，为避免输入到其他文本框，已停止自动输入".to_owned())
                     } else {
                         commit(
                             &text,
@@ -679,6 +706,16 @@ fn run() -> io::Result<()> {
                 .spawn()?;
             "已打开设置".into()
         }
+        "model-server" => {
+            let status = Command::new(home.join(".venv/bin/python"))
+                .arg(home.join("python/resident.py"))
+                .arg("serve")
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("常驻模型服务已退出"));
+            }
+            "常驻模型服务已停止".into()
+        }
         "daemon" | "session" => {
             let cfg: Config =
                 serde_json::from_slice(&fs::read(cfg_path)?).map_err(io::Error::other)?;
@@ -738,6 +775,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layer_shell_and_regular_text_fields_keep_focus_protection() {
+        assert!(same_input_target(
+            None,
+            None,
+            "launcher-field",
+            "launcher-field"
+        ));
+        assert!(same_input_target(
+            Some(1),
+            None,
+            "launcher-field",
+            "launcher-field"
+        ));
+        assert!(!same_input_target(
+            None,
+            None,
+            "launcher-field",
+            "other-field"
+        ));
+        assert!(!same_input_target(Some(1), Some(1), "field-a", "field-b"));
+        assert!(!same_input_target(Some(1), Some(1), "field-a", ""));
+        assert!(same_input_target(Some(1), Some(1), "", ""));
+        assert!(!same_input_target(Some(1), Some(2), "", ""));
+        assert!(!same_input_target(None, None, "", ""));
+    }
     #[test]
     fn model_startup_errors_reach_chinese_message() {
         let mut reply = io::Cursor::new(b"{\"error\":\"CUDA failed with error out of memory\"}\n");

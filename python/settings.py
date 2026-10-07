@@ -7,6 +7,7 @@ import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, Gdk, GLib
 import settings_data as data
+from model_catalog import MODELS
 
 CONFIG = Path.home()/'.config/qingyin/config.json'
 CLI = str(Path.home()/'.local/bin/qingyin')
@@ -126,15 +127,26 @@ class Settings(Gtk.Application):
         refresh.connect('clicked', lambda _: self.refresh()); card.append(refresh)
         self.minimum = max(6144, int(self.config.get('gpu_min_free_mib', 6144)))
         card.append(label(f'显存保护：加载前至少需要 {self.minimum/1024:g} GiB 空闲显存；指定显卡不可用时停止加载。', 'muted'))
+        self.resident = Gtk.Switch(active=self.config.get('resident_model', False))
+        self.row(card, '模型常驻', '首次录音加载后保留模型，加快后续识别；持续占用内存 / 显存', self.resident)
         card = self.card(page, '本地识别模型')
         self.models = data.models(self.config)
-        names = [p.name + (' · 精度优先' if p.name=='large-v3' else ' · 速度优先' if p.name=='large-v3-turbo' else '') for p in self.models]
+        names = [p.name+' · '+MODELS.get(p.name, ('','自定义模型'))[1] for p in self.models]
         self.model = Gtk.DropDown.new_from_strings(names)
         self.model.set_selected(next(i for i,p in enumerate(self.models) if str(p)==self.config['model']))
         card.append(self.model)
         self.model_info = label('', 'muted'); card.append(self.model_info)
         self.model.connect('notify::selected', lambda *_: self.update_model()); self.update_model()
-        card.append(label('这里只显示已安装的模型；切换不会下载文件。', 'muted'))
+        card.append(label('以上只显示已安装模型，支持中文和中英混说。', 'muted'))
+        self.catalog_names = list(MODELS)
+        self.catalog = Gtk.DropDown.new_from_strings([name+' · '+MODELS[name][1] for name in self.catalog_names])
+        self.catalog.set_selected(self.catalog_names.index('small')); card.append(self.catalog)
+        self.download_button = Gtk.Button(label='下载所选模型'); self.download_button.set_halign(Gtk.Align.START)
+        self.download_button.connect('clicked', self.download_model); card.append(self.download_button)
+        self.download_notice = label('下载需要联网；识别仍完全离线。小模型更省资源，准确率可能下降。', 'muted'); card.append(self.download_notice)
+        self.compute = Gtk.DropDown.new_from_strings(['FP16 · 标准精度', 'INT8 + FP16 · 降低显存占用'])
+        self.compute.set_selected(1 if self.config.get('compute_type')=='int8_float16' else 0)
+        self.row(card, 'GPU 推理精度', 'CPU 始终使用 INT8；显存保护保持开启', self.compute)
         card = self.card(page, '识别偏好')
         self.language = Gtk.DropDown.new_from_strings(['中文 / 中英混说', '自动识别语言'])
         self.language.set_selected(0 if self.config['language']=='zh' else 1)
@@ -142,8 +154,33 @@ class Settings(Gtk.Application):
         self.beam = Gtk.SpinButton.new_with_range(1, 10, 1); self.beam.set_value(self.config.get('beam_size', 5))
         self.row(card, '解码精度', '1 更快；5 精度优先，数值越高通常越慢', self.beam)
 
+    def download_model(self, *_):
+        name = self.catalog_names[self.catalog.get_selected()]
+        self.download_button.set_sensitive(False); self.download_notice.set_text('正在下载 '+name+'… 完成后刷新模型列表')
+        def work():
+            try:
+                root = Path(__file__).resolve().parents[1]
+                result = subprocess.run([str(root/'.venv/bin/python'), str(root/'download_model.py'), name], capture_output=True, text=True)
+                error = '' if result.returncode==0 else '下载失败，请检查网络或磁盘空间后重试'
+            except Exception: error = '无法启动下载程序，请检查安装环境'
+            GLib.idle_add(self.download_finished, name, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def download_finished(self, name, error):
+        if self.closed: return False
+        self.download_button.set_sensitive(True)
+        if error: self.download_notice.set_text(error); return False
+        previous = str(self.models[self.model.get_selected()])
+        self.models = data.models(self.config)
+        self.model.set_model(Gtk.StringList.new([p.name+' · '+MODELS.get(p.name, ('','自定义模型'))[1] for p in self.models]))
+        self.model.set_selected(next((i for i,p in enumerate(self.models) if str(p)==previous),0))
+        self.download_notice.set_text(name+' 已安装；在上方选择后保存即可使用')
+        self.update_model(); return False
+
     def update_model(self):
-        p = self.models[self.model.get_selected()]
+        index = self.model.get_selected()
+        if index >= len(self.models): return
+        p = self.models[index]
         self.model_info.set_text(str(p) + ('\n模型文件缺失，请重新安装' if not (p/'model.bin').is_file() else ''))
 
     def refresh(self):
@@ -197,7 +234,7 @@ class Settings(Gtk.Application):
         button.connect('clicked', lambda _: subprocess.Popen([CLI,'vocabulary'])); card.append(button)
 
     def input(self):
-        page = self.page('input', '按一下，开始说', '快捷键随用随取，结束后释放模型和显存。')
+        page = self.page('input', '按一下，开始说', '默认用完即释放；开启常驻后保留模型供下次使用。')
         card = self.card(page, '音频输入')
         try: self.sources = data.microphones()
         except Exception: self.sources = [(None, '系统默认麦克风')]
@@ -222,7 +259,10 @@ class Settings(Gtk.Application):
             if not (model/'model.bin').is_file(): raise ValueError('模型文件不存在，无法保存')
             if device=='cuda' and uuid and not any(g['uuid']==uuid for g in self.cards):
                 raise ValueError('指定显卡当前不可用，请刷新或选择 CPU')
-            self.config = data.save(CONFIG, dict(device=device,gpu_uuid=uuid,model=str(model),
+            stopped = subprocess.run(['systemctl','--user','stop','qingyin-model.service'], capture_output=True, timeout=5)
+            if stopped.returncode: raise ValueError('无法释放常驻模型，请重试；设置未保存')
+            self.config = data.save(CONFIG, dict(resident_model=self.resident.get_active(),device=device,gpu_uuid=uuid,model=str(model),
+                compute_type='int8_float16' if self.compute.get_selected()==1 else 'float16',
                 beam_size=self.beam.get_value_as_int(),language='zh' if self.language.get_selected()==0 else 'auto',
                 punctuation=self.punctuation.get_active(),learning=self.learning.get_active(),
                 auto_input=self.auto.get_active(),show_panel=self.panel.get_active(),
