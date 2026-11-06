@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from model_catalog import installed
 
 
 def graphics():
@@ -19,7 +20,7 @@ def models(config):
     current = Path(config['model'])
     parents = {current.parent, Path.home()/'.local/share/qingyin/models'}
     found = {str(p) for parent in parents if parent.is_dir()
-             for p in parent.iterdir() if p.is_dir() and (p/'model.bin').is_file()}
+             for p in parent.iterdir() if p.is_dir() and installed(p)}
     found.add(str(current))
     return [Path(p) for p in sorted(found)]
 
