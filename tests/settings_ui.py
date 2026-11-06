@@ -30,5 +30,21 @@ with tempfile.TemporaryDirectory() as tmp:
   app.device.set_selected(2)
   app.apply_devices(('cuda','GPU-big'),[], '设备离线');app.device.set_selected(len(app.devices)-1);app.save();assert cfg.read_text()==before
   assert cfg.stat().st_mode & 0o777 == 0o600
+  class FakeProc:
+   def __init__(self,*a,**k):self.stdout=iter(['PROGRESS 50000000 200000000\n','noise\n','PROGRESS 200000000 200000000\n']);self.args=a
+   def wait(self):return 0
+  seen=[]
+  orig=app.download_progress
+  app.download_progress=lambda *a:(seen.append(a[3:]),orig(*a))[1]
+  with patch.object(settings.subprocess,'Popen',FakeProc):
+   app.download_button.emit('clicked')
+   assert not app.download_button.get_sensitive() and app.download_bar.get_visible()
+   deadline=time.monotonic()+3
+   while not app.download_button.get_sensitive() and time.monotonic()<deadline:
+    while GLib.MainContext.default().pending():GLib.MainContext.default().iteration(False)
+    time.sleep(.01)
+  assert app.download_button.get_sensitive() and not app.download_bar.get_visible()
+  assert seen==[(50000000,200000000),(200000000,200000000)],seen
+  assert '已安装' in app.download_notice.get_text()
   app.window.destroy();app.quit()
-print('PASS: GPU/CPU/model/punctuation persistence, preserved fields, private config, active-session guard and missing GPU rejection')
+print('PASS: GPU/CPU/model/punctuation persistence, preserved fields, private config, active-session guard, missing GPU rejection and download progress')

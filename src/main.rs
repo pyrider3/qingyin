@@ -35,9 +35,13 @@ struct Config {
     #[serde(default)]
     hotwords: String,
     #[serde(default = "default_punctuation")]
+    rime_dictionary: bool,
+    #[serde(default = "default_punctuation")]
     punctuation: bool,
     #[serde(default = "default_punctuation")]
     learning: bool,
+    #[serde(default = "default_punctuation")]
+    live_preview: bool,
 }
 fn default_punctuation() -> bool {
     true
@@ -138,7 +142,7 @@ impl Worker {
                 writeln!(
                     input,
                     "{}",
-                    json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"punctuation":c.punctuation,"learning":c.learning,"context":context})
+                    json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"rime_dictionary":c.rime_dictionary,"punctuation":c.punctuation,"learning":c.learning,"context":context})
                 )?;
                 input.flush()?;
                 let v = worker_reply(&mut output)?;
@@ -339,13 +343,80 @@ fn request(cmd: &str) -> io::Result<String> {
     }
     Ok(line)
 }
+struct Preview {
+    child: Child,
+    updates: Receiver<String>,
+}
+impl Drop for Preview {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+fn preview_ready(home: &Path) -> bool {
+    let base = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share")
+        });
+    let dir = base.join("qingyin/preview/streaming-paraformer-zh-en");
+    ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"]
+        .iter()
+        .all(|name| dir.join(name).is_file())
+        && home.join("python/preview.py").is_file()
+}
+/// Best-effort live preview. Any failure only means no preview; recording is unaffected.
+fn start_preview(home: &Path, audio: &Path) -> Option<Preview> {
+    if !preview_ready(home) {
+        return None;
+    }
+    let mut child = Command::new(home.join(".venv/bin/python"))
+        .arg(home.join("python/preview.py"))
+        .arg(audio)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let output = child.stdout.take()?;
+    let (tx, updates) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && let Some(text) = value["text"].as_str()
+                && tx.send(text.to_owned()).is_err()
+            {
+                break;
+            }
+        }
+    });
+    Some(Preview { child, updates })
+}
+/// Fire-and-forget: the plugin never replies to the preview, and focus rules live there.
+fn send_preedit(rt: &Path, text: Option<&str>) {
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
+    };
+    let payload = match text {
+        Some(text) => format!("\u{1f}qingyin:preedit\n{text}"),
+        None => "\u{1f}qingyin:preedit-clear".to_owned(),
+    };
+    let _ = sock.send_to(
+        payload.as_bytes(),
+        rt.parent().unwrap().join("qingyin-fcitx.sock"),
+    );
+}
 struct Session {
     recorder: Option<Child>,
     worker: Option<Worker>,
+    preview: Option<Preview>,
     rt: PathBuf,
 }
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.preview.take().is_some() {
+            send_preedit(&self.rt, None);
+        }
         if let Some(mut recorder) = self.recorder.take() {
             stop_record(&mut recorder);
         }
@@ -384,6 +455,9 @@ fn stop_and_transcribe(
 ) -> io::Result<()> {
     if let Some(mut child) = session.recorder.take() {
         stop_record(&mut child);
+    }
+    if session.preview.take().is_some() {
+        send_preedit(&session.rt, None);
     }
     set_state(
         state,
@@ -464,6 +538,7 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
     let mut session = Session {
         recorder: None,
         worker: None,
+        preview: None,
         rt: rt.clone(),
     };
     let path = rt.join("state.json");
@@ -473,6 +548,9 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
     // Record before model initialization so speech at the first key press is preserved.
     let startup = (|| -> io::Result<()> {
         session.recorder = Some(start_record(&cfg, &rt.join("recording.wav"))?);
+        if cfg.live_preview {
+            session.preview = start_preview(&home, &rt.join("recording.wav"));
+        }
         set_state(
             &state,
             &path,
@@ -544,6 +622,20 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
             Err(e) => return Err(e),
+        }
+        if let Some(preview) = session.preview.as_ref() {
+            // Keep only the newest partial text; the final recognizer decides what is typed.
+            let latest = preview.updates.try_iter().last();
+            if let Some(text) = latest
+                && session.recorder.is_some()
+            {
+                {
+                    let mut current = state.lock().unwrap();
+                    current.text = text.clone();
+                    state_write(&path, &current);
+                }
+                send_preedit(&rt, Some(&text));
+            }
         }
         let event = session.worker.as_ref().unwrap().events.try_recv().ok();
         if let Some(Event::Result(result)) = event {

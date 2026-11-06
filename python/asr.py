@@ -6,8 +6,14 @@ from gpu_policy import prepare_cuda
 from normalize import simplified, without_final_period
 from punctuation import restore_isolated
 import learning
+import rime_dictionary
+from prompt_budget import prepare
 model_dir = Path(sys.argv[1])
 device = sys.argv[2] if len(sys.argv) > 2 else "cuda"
+import paraformer_engine
+if paraformer_engine.is_model(model_dir):
+    paraformer_engine.serve(model_dir)  # CPU only; never touches CUDA
+    sys.exit(0)
 try:
     if device == "cuda":
         gpu = prepare_cuda()
@@ -34,6 +40,13 @@ for line in sys.stdin:
                 print(f'个人词库读取失败，保留原识别：{exc}', file=sys.stderr, flush=True)
         hotwords = ', '.join(filter(None, [request.get('hotwords'), learning.hints(vocabulary)]))
         context = request.get('context', '')[-512:] if request.get('learning', True) else ''
+        if request.get('rime_dictionary', True):
+            try:
+                dictionary_hints = rime_dictionary.hints(context)
+                hotwords = ', '.join(filter(None, [hotwords, dictionary_hints]))
+            except Exception as exc:
+                print(f'雾凇词库读取失败，保留原识别：{exc}', file=sys.stderr, flush=True)
+        context, hotwords = prepare(context, hotwords, model.hf_tokenizer)
         segments, info = model.transcribe(samples, language=None if request.get("language") == "auto" else request.get("language", "zh"),
                                          vad_filter=True,
                                          vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400},
@@ -59,5 +72,5 @@ for line in sys.stdin:
 
     finally:
         # Residency retains weights only, not the last recording or input context.
-        for key in ('request','audio','samples','vocabulary','hotwords','context','segments','info','text','line'):
+        for key in ('request','audio','samples','vocabulary','hotwords','context','segments','info','text','line','dictionary_hints'):
             globals().pop(key, None)
