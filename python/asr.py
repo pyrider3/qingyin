@@ -2,12 +2,19 @@
 import json, os, sys, subprocess
 import numpy as np
 from pathlib import Path
+from audio_io import load_audio
 from gpu_policy import prepare_cuda
-from normalize import simplified, without_final_period
+from normalize import clean_spacing, simplified, without_final_period
 from punctuation import restore_isolated
 import learning
+import rime_dictionary
+from prompt_budget import prepare
+import sherpa_engine
 model_dir = Path(sys.argv[1])
 device = sys.argv[2] if len(sys.argv) > 2 else "cuda"
+if sherpa_engine.is_model(model_dir):
+    sherpa_engine.serve(model_dir, run=subprocess.run)  # CPU only; never touches CUDA
+    sys.exit(0)
 try:
     if device == "cuda":
         gpu = prepare_cuda()
@@ -24,8 +31,7 @@ print(json.dumps({"ready": True, "device": device}), flush=True)
 for line in sys.stdin:
     try:
         request = json.loads(line)
-        audio = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", request["path"], "-f", "f32le", "-ac", "1", "-ar", "16000", "pipe:1"], check=True, capture_output=True).stdout
-        samples = np.frombuffer(audio, dtype=np.float32).copy()
+        samples = load_audio(request["path"], run=subprocess.run)
         vocabulary = {'rules': []}
         if request.get('learning', True):
             try:
@@ -34,6 +40,13 @@ for line in sys.stdin:
                 print(f'个人词库读取失败，保留原识别：{exc}', file=sys.stderr, flush=True)
         hotwords = ', '.join(filter(None, [request.get('hotwords'), learning.hints(vocabulary)]))
         context = request.get('context', '')[-512:] if request.get('learning', True) else ''
+        if request.get('rime_dictionary', True):
+            try:
+                dictionary_hints = rime_dictionary.hints(context)
+                hotwords = ', '.join(filter(None, [hotwords, dictionary_hints]))
+            except Exception as exc:
+                print(f'雾凇词库读取失败，保留原识别：{exc}', file=sys.stderr, flush=True)
+        context, hotwords = prepare(context, hotwords, model.hf_tokenizer)
         segments, info = model.transcribe(samples, language=None if request.get("language") == "auto" else request.get("language", "zh"),
                                          vad_filter=True,
                                          vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400},
@@ -43,7 +56,7 @@ for line in sys.stdin:
                                          prompt_reset_on_temperature=0.3,
                                          hotwords=hotwords or None,
                                          initial_prompt=context or None)
-        text = simplified("".join(s.text for s in segments).strip())
+        text = clean_spacing(simplified("".join(s.text for s in segments).strip()))
         text = learning.apply(text, vocabulary)
         if request.get("punctuation", True):
             try:
@@ -59,5 +72,5 @@ for line in sys.stdin:
 
     finally:
         # Residency retains weights only, not the last recording or input context.
-        for key in ('request','audio','samples','vocabulary','hotwords','context','segments','info','text','line'):
+        for key in ('request','audio','samples','vocabulary','hotwords','context','segments','info','text','line','dictionary_hints'):
             globals().pop(key, None)

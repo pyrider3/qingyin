@@ -6,7 +6,8 @@ root=Path(__file__).resolve().parents[1];sys.path.insert(0,str(root/'python'))
 import learning
 seen=[]
 class FakeModel:
- def __init__(self,*_,**__):pass
+ def __init__(self,*_,**__):
+  self.hf_tokenizer=types.SimpleNamespace(encode=lambda text:types.SimpleNamespace(ids=list(text)),decode=lambda tokens:''.join(tokens))
  def transcribe(self,_,**kwargs):
   seen.append(kwargs)
   return [types.SimpleNamespace(text='打开青英')],None

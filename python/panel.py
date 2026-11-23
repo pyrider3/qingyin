@@ -12,10 +12,11 @@ class Panel(Gtk.Application):
         self.last = None
         self.once = "--once" in sys.argv
         self.was_visible = False
+        self.target = [0.06]*36; self.shown = [0.06]*36; self.recording = False
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title='青音')
         self.window.set_default_size(460, 140)
-        self.window.set_decorated(False)
+        self.window.set_decorated(False); self.window.add_css_class('qp')
         self.window.connect('close-request', self.dismiss)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.set_margin_top(18); box.set_margin_bottom(18)
@@ -28,7 +29,7 @@ class Panel(Gtk.Application):
         self.wave.set_draw_func(self.draw_wave)
         box.append(self.wave)
         self.text = Gtk.Label(xalign=0, wrap=True, selectable=True)
-        self.text.set_max_width_chars(56)
+        self.text.set_max_width_chars(56); self.text.set_focusable(False); self.text.add_css_class('body')
         box.append(self.text)
         self.buttons = Gtk.Box(spacing=10)
         for label, action in [('复制', 'copy'), ('纠正并学习', 'edit'), ('取消 / 关闭', 'cancel')]:
@@ -36,15 +37,24 @@ class Panel(Gtk.Application):
             button.connect('clicked', lambda _, a=action: subprocess.Popen([cli, a]))
             self.buttons.append(button)
             if action == 'edit': self.edit_button = button
-            if action == 'copy': self.copy_button = button
+            if action == 'copy': self.copy_button = button; button.add_css_class('accent')
         box.append(self.buttons)
         self.window.set_child(box)
         provider = Gtk.CssProvider()
-        provider.load_from_data(b'window { background: #0a1118; color: #f0f5fa; border-radius: 16px; } .heading { color: #59d8ff; font-size: 18px; font-weight: bold; } button { background: #182630; color: #e9f4ff; border-radius: 10px; }')
+        provider.load_from_data(b"""
+window.qp { background: linear-gradient(160deg, #0d1620, #0a1118); color: #eef5fb; border-radius: 20px; border: 1px solid rgba(95,226,213,0.28); }
+.heading { color: #7ef2e2; font-size: 17px; font-weight: 800; }
+.heading.error { color: #ffb38a; }
+.body { color: #d6e3ee; font-size: 14px; }
+button { background: rgba(255,255,255,0.06); color: #e6f1fa; border: 1px solid rgba(255,255,255,0.1); border-radius: 11px; box-shadow: none; padding: 6px 16px; transition: background 200ms ease, border-color 200ms ease; }
+button:hover { background: rgba(95,226,213,0.14); border-color: rgba(95,226,213,0.45); }
+button.accent { background: linear-gradient(135deg, #5fe2d5, #3fc2de); color: #06292b; border: none; font-weight: 800; }
+""")
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         GLib.timeout_add(200, self.tick)
+        self.wave.add_tick_callback(self.animate)
         self.tick()
-    def draw_wave(self, area, ctx, width, height):
+    def read_levels(self):
         levels = [0.06] * 36
         try:
             with (state_path.parent / 'recording.wav').open('rb') as f:
@@ -57,11 +67,22 @@ class Panel(Gtk.Application):
                 step = max(1, len(samples)//36)
                 levels = [min(1.0, math.sqrt(sum((v/32768)**2 for v in samples[i*step:(i+1)*step]) / max(1, len(samples[i*step:(i+1)*step]))) * 5) for i in range(36)]
         except (OSError, ValueError): pass
-        ctx.set_source_rgb(0.35, 0.85, 1.0)
-        for i, level in enumerate(levels):
-            h = max(3, height * level)
-            ctx.rectangle(i * width/36, (height-h)/2, max(2, width/36-5), h)
-        ctx.fill()
+        return levels
+    def animate(self, widget, clock):
+        # Ease bars toward the latest levels each frame; fall back to a calm line when idle.
+        goal = self.target if self.recording else [0.06]*36
+        self.shown = [a + (b-a)*0.28 for a, b in zip(self.shown, goal)]
+        if self.wave.get_visible(): self.wave.queue_draw()
+        return GLib.SOURCE_CONTINUE
+    def draw_wave(self, area, ctx, width, height):
+        n = 36; slot = width/n; bar = max(2, slot-5)
+        for i, level in enumerate(self.shown):
+            h = max(4, height * level); x = i*slot; y = (height-h)/2; r = min(bar/2, h/2)
+            ctx.set_source_rgba(0.37, 0.89, 0.84, 0.45 + 0.55*level)
+            ctx.new_sub_path()
+            ctx.arc(x+r, y+r, r, math.pi, 1.5*math.pi); ctx.arc(x+bar-r, y+r, r, 1.5*math.pi, 2*math.pi)
+            ctx.arc(x+bar-r, y+h-r, r, 0, .5*math.pi); ctx.arc(x+r, y+h-r, r, .5*math.pi, math.pi)
+            ctx.close_path(); ctx.fill()
     def dismiss(self, *_):
         subprocess.Popen([cli, 'dismiss'])
         self.window.set_visible(False)
@@ -81,8 +102,11 @@ class Panel(Gtk.Application):
         if phase == 'recording': title += f" · {int(time.time() - data.get('started', time.time()))} 秒"
         self.title.set_text(title)
         self.text.set_text(data.get('message', '') + ('\n\n' + data['text'] if data.get('text') else ''))
-        self.wave.set_visible(phase == 'recording')
-        self.wave.queue_draw()
+        self.recording = phase == 'recording'
+        if self.recording: self.target = self.read_levels()
+        self.wave.set_visible(self.recording)
+        if phase == 'error': self.title.add_css_class('error')
+        else: self.title.remove_css_class('error')
         self.buttons.set_visible(phase in ('result', 'error', 'recording'))
         self.copy_button.set_visible(phase == 'result' and bool(data.get('text')))
         self.edit_button.set_visible(phase == 'result' and bool(data.get('text')))

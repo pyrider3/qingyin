@@ -5,6 +5,9 @@
 #include <fcitx/inputcontext.h>
 #include <fcitx/surroundingtext.h>
 #include <fcitx/event.h>
+#include <fcitx/inputpanel.h>
+#include <fcitx-utils/trackableobject.h>
+#include <fcitx/text.h>
 #include <fcitx-utils/utf8.h>
 #include <algorithm>
 #include <sstream>
@@ -30,6 +33,10 @@ class Qingyin : public fcitx::AddonInstance {
     uint64_t expires_ = 0;
     bool confirmed_ = false, pending_ = false;
     uint64_t pendingUntil_ = 0;
+    // Live-preview text lives only in the client preedit; it is never committed.
+    fcitx::TrackableObjectReference<fcitx::InputContext> preeditIc_;
+    bool preedit_ = false;
+    uint64_t preeditAt_ = 0;
     static std::string quote(const std::string &text) {
         std::ostringstream out; out << '"';
         for (unsigned char ch : text) {
@@ -47,6 +54,26 @@ class Qingyin : public fcitx::AddonInstance {
     static bool readable(fcitx::InputContext *ic) {
         return ic && ic->hasFocus() && !ic->capabilityFlags().testAny(fcitx::CapabilityFlag::PasswordOrSensitive)
             && ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText) && ic->surroundingText().isValid();
+    }
+    void clearPreedit() {
+        if (!preedit_) return;
+        preedit_ = false;
+        if (auto *ic = preeditIc_.get()) {
+            ic->inputPanel().setClientPreedit(fcitx::Text());
+            ic->updatePreedit();
+        }
+        preeditIc_ = {};
+    }
+    std::string setPreedit(fcitx::InputContext *ic, const std::string &text) {
+        if (!ic || !ic->hasFocus() || ic->capabilityFlags().testAny(fcitx::CapabilityFlag::PasswordOrSensitive)) return "no-focus";
+        if (!ic->capabilityFlags().test(fcitx::CapabilityFlag::Preedit)) return "unsupported";
+        if (text.size() > 4096) return "invalid-command";
+        // The preview follows one text box; if focus moved, drop the old one first.
+        if (preedit_ && preeditIc_.get() != ic) clearPreedit();
+        preeditIc_ = ic->watch(); preedit_ = true; preeditAt_ = fcitx::now(CLOCK_MONOTONIC);
+        ic->inputPanel().setClientPreedit(fcitx::Text(text, fcitx::TextFormatFlag::Underline));
+        ic->updatePreedit();
+        return "ok";
     }
     void clearWatch() {
         watched_.clear(); watchId_.clear(); event_.clear(); original_.clear(); left_.clear(); right_.clear(); finalReply_.clear(); confirmed_ = false; pending_ = false;
@@ -144,6 +171,10 @@ class Qingyin : public fcitx::AddonInstance {
                     if (request == "\x1fqingyin:stop-watch:"+watchId_) clearWatch();
                     reply="ok";
                 }
+                else if (request == "\x1fqingyin:preedit-clear") { clearPreedit(); reply="ok"; }
+                else if (request.rfind("\x1fqingyin:preedit\n",0)==0) {
+                    reply = setPreedit(ic, request.substr(std::string("\x1fqingyin:preedit\n").size()));
+                }
                 else if (request.rfind("\x1fqingyin:",0)==0 &&
                     (request.rfind("\x1fqingyin:learn:",0)!=0 || request.find('\n')==std::string::npos)) {
                     // Reserved protocol messages must never become application text.
@@ -152,6 +183,7 @@ class Qingyin : public fcitx::AddonInstance {
                 else if (ic && ic->hasFocus()) {
                     if (ic->capabilityFlags().testAny(fcitx::CapabilityFlag::PasswordOrSensitive)) reply = "sensitive";
                     else {
+                        clearPreedit();  // final text replaces the preview, never duplicates it
                         const std::string prefix="\x1fqingyin:learn:";
                         auto newline=request.find('\n');
                         if (request.rfind(prefix,0)==0 && newline!=std::string::npos) {
@@ -186,6 +218,7 @@ public:
         focusWatch_ = instance_->watchEvent(fcitx::EventType::InputContextFocusOut,fcitx::EventWatcherPhase::PreInputMethod,
             [this](fcitx::Event &event) {
                 auto &focus=static_cast<fcitx::InputContextEvent &>(event);
+                if (preedit_ && preeditIc_.get()==focus.inputContext()) clearPreedit();
                 if (id(focus.inputContext())==watched_ && finalReply_.empty()) clearWatch();
             });
         surroundingWatch_ = instance_->watchEvent(fcitx::EventType::InputContextSurroundingTextUpdated,fcitx::EventWatcherPhase::PreInputMethod,
@@ -197,6 +230,8 @@ public:
             fcitx::now(CLOCK_MONOTONIC) + 1000000, 100000,
             [this](fcitx::EventSourceTime *timer, uint64_t) {
                 if (!watched_.empty() && fcitx::now(CLOCK_MONOTONIC)>expires_) clearWatch();
+                // A crashed daemon must not leave stale preview text in a text box.
+                if (preedit_ && fcitx::now(CLOCK_MONOTONIC)>preeditAt_+3000000) clearPreedit();
                 struct stat st{};
                 if (lstat(path_.c_str(), &st) < 0) connectSocket();
                 timer->setNextInterval(1000000);

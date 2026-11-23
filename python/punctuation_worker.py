@@ -14,9 +14,13 @@ if os.getppid() != parent_pid or parent_pid == 1:
     sys.exit(1)
 
 from punctuation import restore
-try:
-    text = json.load(sys.stdin)['text']
-    print(json.dumps({'text': restore(text)}, ensure_ascii=False), flush=True)
-except Exception as exc:
-    print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
-    sys.exit(1)
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    try:
+        text = json.loads(raw)['text']
+        print(json.dumps({'text': restore(text)}, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
+        sys.exit(1)
