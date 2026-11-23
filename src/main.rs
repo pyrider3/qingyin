@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{self, BufRead, BufReader, Write},
+    net::Shutdown,
     os::unix::{
         fs::PermissionsExt,
         net::{UnixDatagram, UnixListener, UnixStream},
@@ -42,6 +43,12 @@ struct Config {
     learning: bool,
     #[serde(default = "default_punctuation")]
     live_preview: bool,
+    #[serde(default)]
+    gpu_uuid: String,
+    #[serde(default = "default_gpu_min_free")]
+    gpu_min_free_mib: u64,
+    #[serde(default = "default_idle_unload")]
+    idle_unload_seconds: u64,
 }
 fn default_punctuation() -> bool {
     true
@@ -51,6 +58,12 @@ fn default_compute() -> String {
 }
 fn default_beam() -> u32 {
     5
+}
+fn default_gpu_min_free() -> u64 {
+    6144
+}
+fn default_idle_unload() -> u64 {
+    300
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct State {
@@ -98,27 +111,97 @@ fn worker_reply(output: &mut impl BufRead) -> io::Result<Value> {
     }
     Ok(value)
 }
+fn connect_resident(sock_path: &Path) -> io::Result<UnixStream> {
+    if let Ok(stream) = UnixStream::connect(sock_path) {
+        return Ok(stream);
+    }
+    let start = Command::new("systemctl")
+        .args(["--user", "start", "qingyin-model.service"])
+        .output()?;
+    if !start.status.success() {
+        return Err(io::Error::other(format!(
+            "常驻模型服务启动失败：{}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        )));
+    }
+    for _ in 0..250 {
+        if let Ok(stream) = UnixStream::connect(sock_path) {
+            return Ok(stream);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err(io::Error::other(
+        "常驻模型服务无法连接，请关闭常驻模式后重试",
+    ))
+}
 struct Worker {
-    child: Child,
+    child: Option<Child>,
+    cancel_sock: Option<UnixStream>,
     job: Option<Sender<PathBuf>>,
     events: Receiver<Event>,
     reader: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    fn new(home: &Path, cfg: &Config, context: String) -> io::Result<Self> {
+    fn new(home: &Path, rt: &Path, cfg: &Config, context: String) -> io::Result<Self> {
+        let compute = if cfg.device == "cpu" {
+            "int8".to_owned()
+        } else {
+            cfg.compute_type.clone()
+        };
+        let (job, jobs) = mpsc::channel::<PathBuf>();
+        let (tx, events) = mpsc::channel();
+        let c = cfg.clone();
+
+        if cfg.resident_model {
+            let mut stream = connect_resident(&rt.join("model.sock"))?;
+            let cancel_sock = stream.try_clone()?;
+            let mut output = BufReader::new(stream.try_clone()?);
+            let hello = json!({
+                "model": c.model,
+                "device": c.device,
+                "compute": compute,
+                "gpu_uuid": c.gpu_uuid,
+                "gpu_min_free_mib": c.gpu_min_free_mib,
+                "idle_unload_seconds": c.idle_unload_seconds,
+            });
+            writeln!(stream, "{hello}")?;
+            stream.flush()?;
+            let reader = thread::spawn(move || {
+                let result = (|| -> io::Result<String> {
+                    let v = worker_reply(&mut output)?;
+                    if v["ready"] != true {
+                        return Err(io::Error::other("本地模型未就绪"));
+                    }
+                    let _ = tx.send(Event::Ready);
+                    let path = jobs.recv().map_err(io::Error::other)?;
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"rime_dictionary":c.rime_dictionary,"punctuation":c.punctuation,"learning":c.learning,"context":context})
+                    )?;
+                    stream.flush()?;
+                    let v = worker_reply(&mut output)?;
+                    v["text"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| io::Error::other("识别结果格式错误"))
+                })();
+                let _ = tx.send(Event::Result(result));
+            });
+            return Ok(Self {
+                child: None,
+                cancel_sock: Some(cancel_sock),
+                job: Some(job),
+                events,
+                reader: Some(reader),
+            });
+        }
+
         let mut child = Command::new(home.join(".venv/bin/python"))
-            .arg(home.join(if cfg.resident_model {
-                "python/resident.py"
-            } else {
-                "python/asr.py"
-            }))
+            .arg(home.join("python/asr.py"))
             .arg(&cfg.model)
             .arg(&cfg.device)
-            .arg(if cfg.device == "cpu" {
-                "int8"
-            } else {
-                &cfg.compute_type
-            })
+            .arg(&compute)
             .env("HF_HUB_OFFLINE", "1")
             .env("TRANSFORMERS_OFFLINE", "1")
             .stdin(Stdio::piped())
@@ -127,9 +210,6 @@ impl Worker {
             .spawn()?;
         let mut input = child.stdin.take().unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap());
-        let (job, jobs) = mpsc::channel::<PathBuf>();
-        let (tx, events) = mpsc::channel();
-        let c = cfg.clone();
         let reader = thread::spawn(move || {
             let result = (|| -> io::Result<String> {
                 let v = worker_reply(&mut output)?;
@@ -154,7 +234,8 @@ impl Worker {
             let _ = tx.send(Event::Result(result));
         });
         Ok(Self {
-            child,
+            child: Some(child),
+            cancel_sock: None,
             job: Some(job),
             events,
             reader: Some(reader),
@@ -171,9 +252,14 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         // Also interrupt loading or inference on cancellation, rather than waiting for it.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         self.job.take();
+        if let Some(sock) = self.cancel_sock.take() {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -321,11 +407,11 @@ fn stop_record(child: &mut Child) {
     let _ = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status();
-    for _ in 0..40 {
+    for _ in 0..100 {
         if child.try_wait().ok().flatten().is_some() {
             return;
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(10));
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -344,13 +430,19 @@ fn request(cmd: &str) -> io::Result<String> {
     Ok(line)
 }
 struct Preview {
-    child: Child,
+    child: Option<Child>,
+    sock: Option<UnixStream>,
     updates: Receiver<String>,
 }
 impl Drop for Preview {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(sock) = self.sock.take() {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 fn preview_ready(home: &Path) -> bool {
@@ -359,16 +451,60 @@ fn preview_ready(home: &Path) -> bool {
         .unwrap_or_else(|| {
             PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share")
         });
-    let dir = base.join("qingyin/preview/streaming-paraformer-zh-en");
-    ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"]
+    let xasr_dir = base.join("qingyin/preview/x-asr-streaming-zh-en");
+    let para_dir = base.join("qingyin/preview/streaming-paraformer-zh-en");
+    let xasr_ok = [
+        "encoder.int8.onnx",
+        "decoder.onnx",
+        "joiner.int8.onnx",
+        "tokens.txt",
+    ]
+    .iter()
+    .all(|name| xasr_dir.join(name).is_file());
+    let para_ok = ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"]
         .iter()
-        .all(|name| dir.join(name).is_file())
-        && home.join("python/preview.py").is_file()
+        .all(|name| para_dir.join(name).is_file());
+    (xasr_ok || para_ok) && home.join("python/preview.py").is_file()
 }
-/// Best-effort live preview. Any failure only means no preview; recording is unaffected.
-fn start_preview(home: &Path, audio: &Path) -> Option<Preview> {
+/// Best-effort live preview. Prefers zero-cold-start resident preview socket when active.
+fn start_preview(home: &Path, rt: &Path, audio: &Path, resident_model: bool) -> Option<Preview> {
     if !preview_ready(home) {
         return None;
+    }
+    if resident_model {
+        let sock_path = rt.join("preview.sock");
+        let mut connected = UnixStream::connect(&sock_path).ok();
+        if connected.is_none() {
+            for _ in 0..10 {
+                thread::sleep(Duration::from_millis(15));
+                if let Ok(s) = UnixStream::connect(&sock_path) {
+                    connected = Some(s);
+                    break;
+                }
+            }
+        }
+        if let Some(mut stream) = connected
+            && writeln!(stream, "{}", json!({"wav": audio})).is_ok()
+            && stream.flush().is_ok()
+            && let Ok(read_stream) = stream.try_clone()
+        {
+            let (tx, updates) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(read_stream).lines().map_while(Result::ok) {
+                    if let Ok(value) = serde_json::from_str::<Value>(&line)
+                        && let Some(text) = value["text"].as_str()
+                        && tx.send(text.to_owned()).is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            return Some(Preview {
+                child: None,
+                sock: Some(stream),
+                updates,
+            });
+        }
     }
     let mut child = Command::new(home.join(".venv/bin/python"))
         .arg(home.join("python/preview.py"))
@@ -390,7 +526,11 @@ fn start_preview(home: &Path, audio: &Path) -> Option<Preview> {
             }
         }
     });
-    Some(Preview { child, updates })
+    Some(Preview {
+        child: Some(child),
+        sock: None,
+        updates,
+    })
 }
 /// Fire-and-forget: the plugin never replies to the preview, and focus rules live there.
 fn send_preedit(rt: &Path, text: Option<&str>) {
@@ -442,7 +582,15 @@ fn start_record(cfg: &Config, audio: &Path) -> io::Result<Child> {
         command.args(["--target", m]);
     }
     let mut child = command.arg(audio).stderr(Stdio::inherit()).spawn()?;
-    thread::sleep(Duration::from_millis(150));
+    for _ in 0..25 {
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::other("麦克风录音启动失败，请检查音频设备"));
+        }
+        if audio.metadata().map(|m| m.len() >= 44).unwrap_or(false) {
+            return Ok(child);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     if child.try_wait()?.is_some() {
         return Err(io::Error::other("麦克风录音启动失败，请检查音频设备"));
     }
@@ -547,10 +695,8 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
     let mut target_context = String::new();
     // Record before model initialization so speech at the first key press is preserved.
     let startup = (|| -> io::Result<()> {
-        session.recorder = Some(start_record(&cfg, &rt.join("recording.wav"))?);
-        if cfg.live_preview {
-            session.preview = start_preview(&home, &rt.join("recording.wav"));
-        }
+        let wav_path = rt.join("recording.wav");
+        session.recorder = Some(start_record(&cfg, &wav_path)?);
         set_state(
             &state,
             &path,
@@ -565,7 +711,10 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
         } else {
             String::new()
         };
-        session.worker = Some(Worker::new(&home, &cfg, context)?);
+        session.worker = Some(Worker::new(&home, &rt, &cfg, context)?);
+        if cfg.live_preview {
+            session.preview = start_preview(&home, &rt, &wav_path, cfg.resident_model);
+        }
         Ok(())
     })();
     if let Err(e) = startup {
@@ -729,7 +878,7 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                 return Ok(());
             }
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 fn toggle() -> io::Result<String> {
@@ -754,7 +903,7 @@ fn toggle() -> io::Result<String> {
             String::from_utf8_lossy(&result.stderr).to_string(),
         ));
     }
-    for _ in 0..200 {
+    for _ in 0..500 {
         if let Ok(reply) = request("status") {
             let v: Value = serde_json::from_str(&reply).map_err(io::Error::other)?;
             return Ok(if v["phase"] == "recording" {
@@ -763,7 +912,7 @@ fn toggle() -> io::Result<String> {
                 reply
             });
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(10));
     }
     Err(io::Error::other(
         "启动超时，请查看 journalctl --user -u qingyin",
@@ -802,6 +951,7 @@ fn run() -> io::Result<()> {
             let status = Command::new(home.join(".venv/bin/python"))
                 .arg(home.join("python/resident.py"))
                 .arg("serve")
+                .env("QINGYIN_EXIT_ON_IDLE", "1")
                 .status()?;
             if !status.success() {
                 return Err(io::Error::other("常驻模型服务已退出"));

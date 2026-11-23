@@ -19,7 +19,7 @@ addon.write_text((root/'fcitx/qingyin.conf').read_text().replace('Library=libqin
 config=home/'.config/qingyin/config.json'
 config.parent.mkdir(parents=True,exist_ok=True)
 if not config.exists():
- config.write_text(json.dumps({'model':str(share/'models/large-v3'),'device':'cuda','language':'zh','auto_input':True,'microphone':None,'max_seconds':300,'show_panel':False,'compute_type':'float16','beam_size':5,'hotwords':'','punctuation':True,'learning':True},ensure_ascii=False,indent=2)+'\n')
+ config.write_text(json.dumps({'model':str(share/'models/x-asr-zh-en'),'device':'cpu','language':'zh','auto_input':True,'microphone':None,'max_seconds':300,'show_panel':False,'compute_type':'float16','beam_size':5,'hotwords':'','punctuation':True,'learning':True,'resident_model':True,'idle_unload_seconds':300,'rime_dictionary':True,'live_preview':True},ensure_ascii=False,indent=2)+'\n')
 launcher=home/'.local/bin/qingyin'
 launcher.parent.mkdir(parents=True,exist_ok=True)
 site=next((root/'.venv/lib').glob('python*/site-packages'))

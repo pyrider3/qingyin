@@ -59,26 +59,64 @@ def restore(text):
     return merge_punctuation(text, _model.add_punctuation(text))
 
 
+_worker = None
+
+
+def close_isolated():
+    global _worker
+    if _worker is not None:
+        try:
+            _worker.kill()
+            _worker.wait(timeout=2)
+        except Exception:
+            pass
+        _worker = None
+
+
 def restore_isolated(text):
-    """Avoid native symbol collisions between Whisper VAD and sherpa ORT."""
+    """Avoid native symbol collisions between Whisper VAD and sherpa ORT, reusing one warm worker."""
+    global _worker
     if not text or not re.search(r'[\u4e00-\u9fff]', text):
         return text
+    import atexit
     import json
     import os
+    import select
     import subprocess
     import sys
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name('punctuation_worker.py'))],
-        input=json.dumps({'text': text}, ensure_ascii=False),
-        text=True, capture_output=True, timeout=60,
-        env={**os.environ, 'QINGYIN_ASR_PARENT': str(os.getpid())})
-    if result.stderr:
-        print(result.stderr, file=sys.stderr, end='')
-    if not result.stdout.strip():
-        raise RuntimeError(f'标点进程意外退出（退出码 {result.returncode}），原转写已保留')
-    reply = json.loads(result.stdout)
+
+    if _worker is None or _worker.poll() is not None:
+        close_isolated()
+        _worker = subprocess.Popen(
+            [sys.executable, str(Path(__file__).with_name('punctuation_worker.py'))],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True,
+            bufsize=1,
+            env={**os.environ, 'QINGYIN_ASR_PARENT': str(os.getpid())},
+        )
+        atexit.register(close_isolated)
+    try:
+        _worker.stdin.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
+        _worker.stdin.flush()
+        ready, _, _ = select.select([_worker.stdout], [], [], 60)
+        if not ready:
+            close_isolated()
+            raise RuntimeError('标点进程超时，原转写已保留')
+        line = _worker.stdout.readline()
+    except Exception:
+        close_isolated()
+        raise
+    if not line.strip():
+        code = _worker.poll()
+        close_isolated()
+        raise RuntimeError(f'标点进程意外退出（退出码 {code}），原转写已保留')
+    reply = json.loads(line)
     if 'error' in reply:
+        close_isolated()
         raise RuntimeError(reply['error'])
-    if result.returncode != 0 or not isinstance(reply.get('text'), str):
+    if not isinstance(reply.get('text'), str):
+        close_isolated()
         raise RuntimeError('标点进程返回了无效结果，原转写已保留')
     return reply['text']

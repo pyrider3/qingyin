@@ -34,6 +34,7 @@ jobs:
           python tests/preview.py
           python tests/resident.py
           python tests/punctuation_isolation.py
+          python tests/sherpa_upgrade.py
           python tests/lifecycle.py
       - name: Build fcitx5 addon
         run: |
