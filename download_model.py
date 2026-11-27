@@ -225,6 +225,9 @@ download_paraformer = download_sherpa
 
 PREVIEW = 'streaming-preview'
 XASR_PREVIEW = 'x-asr-preview'
+SILERO_VAD = 'silero-vad'
+SILERO_VAD_SHA256 = '9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6'
+SILERO_VAD_URL = _GH_ASR + 'silero_vad.onnx'
 PREVIEW_REVISION = '8e40c43232a1c5c66c82111efc5820d3accca11b'
 PREVIEW_BASE = 'https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en/resolve/' + PREVIEW_REVISION + '/'
 PREVIEW_SIZES = {'encoder.int8.onnx': 165462184, 'decoder.int8.onnx': 71664561, 'tokens.txt': 75756}
@@ -295,11 +298,30 @@ def download_xasr_preview():
     print('X-ASR 实时预览模型已安装', flush=True)
 
 
+def download_silero_vad():
+    base = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'qingyin/vad'
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / 'silero_vad.onnx'
+    if target.is_file() and sha256_of(target) == SILERO_VAD_SHA256:
+        print('Silero VAD 模型已安装', flush=True)
+        return
+    part = base / 'silero_vad.onnx.part'
+    print('正在下载 Silero VAD v5（约 0.6 MB）', flush=True)
+    fetch(SILERO_VAD_URL, part, progress=Progress())
+    if sha256_of(part) != SILERO_VAD_SHA256:
+        part.unlink(missing_ok=True)
+        raise RuntimeError('Silero VAD 校验失败，请重新下载')
+    os.replace(part, target)
+    print('Silero VAD 模型已安装', flush=True)
+
+
 def download(name):
     if name == PREVIEW:
         return download_preview()
     if name == XASR_PREVIEW:
         return download_xasr_preview()
+    if name == SILERO_VAD:
+        return download_silero_vad()
     if name in SHERPA_MODELS:
         return download_sherpa(name)
     # The normal launcher is offline; explicit model downloads may go online.
@@ -336,7 +358,7 @@ def download(name):
 
 
 if __name__ == '__main__':
-    valid = (*MODELS, PREVIEW, XASR_PREVIEW)
+    valid = (*MODELS, PREVIEW, XASR_PREVIEW, SILERO_VAD)
     if len(sys.argv) != 2 or sys.argv[1] not in valid:
         raise SystemExit('请选择模型：' + ', '.join(valid))
     try:

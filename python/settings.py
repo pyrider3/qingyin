@@ -1,10 +1,15 @@
 """Qingyin Studio Settings: modern GTK4 control center for local models, memory and output."""
 import json
 import math
+import os
 from pathlib import Path
 import re
+import shutil
+import signal
+import socket
 import subprocess
 import threading
+import time
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -32,6 +37,13 @@ IDLE_PRESETS = [
     (5, '5 分钟'),
     (10, '10 分钟'),
     (30, '30 分钟'),
+]
+
+AUTO_STOP_PRESETS = [
+    (0, '关闭'),
+    (1000, '1.0 秒'),
+    (1300, '1.3 秒'),
+    (1800, '1.8 秒'),
 ]
 
 MODEL_META = {
@@ -367,6 +379,17 @@ button.select-pill.selected {
     border-color: rgba(52, 211, 153, 0.45);
     color: #a7f3d0;
 }
+button.danger-pill {
+    background: transparent;
+    color: #f87171;
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-radius: 8px;
+    box-shadow: none;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+button.danger-pill:hover { background: rgba(248, 113, 113, 0.14); border-color: rgba(248, 113, 113, 0.5); }
 
 button.primary {
     background: @accent;
@@ -514,7 +537,11 @@ class Settings(Gtk.Application):
         self.model_cards = {}
         self.whisper_buttons = {}
         self.idle_buttons = {}
+        self.auto_stop_buttons = {}
         self.lang_buttons = {}
+        self.auto_stop_ms = 0
+        self.test_recorder = None
+        self.test_wav = None
 
     def do_activate(self):
         if self.get_active_window():
@@ -663,6 +690,14 @@ class Settings(Gtk.Application):
 
     def close(self, *_):
         self.closed = True
+        if self.test_recorder is not None:
+            try:
+                self.test_recorder.kill()
+            except Exception:
+                pass
+            self.test_recorder = None
+        if self.test_wav is not None:
+            self.test_wav.unlink(missing_ok=True)
         if self.status_timer:
             GLib.source_remove(self.status_timer)
             self.status_timer = 0
@@ -761,8 +796,12 @@ class Settings(Gtk.Application):
         cfg = self.config
         self.resident.set_active(cfg.get('resident_model', False))
         self.set_idle_minutes(int(cfg.get('idle_unload_seconds', 300)) // 60)
+        self.set_auto_stop_ms(int(cfg.get('auto_stop_silence_ms', 0)))
         self.punctuation.set_active(cfg.get('punctuation', True))
         self.auto.set_active(cfg.get('auto_input', True))
+        self.clipboard_fb.set_active(cfg.get('clipboard_fallback', True))
+        self.clean_fillers.set_active(cfg.get('clean_fillers', False))
+        self.sound_fb.set_active(cfg.get('sound_feedback', True))
         self.panel.set_active(cfg.get('show_panel', False))
         self.preview.set_active(cfg.get('live_preview', True))
         self.learning.set_active(cfg.get('learning', True))
@@ -774,6 +813,8 @@ class Settings(Gtk.Application):
         self.hotwords_buf.set_text(cfg.get('hotwords', ''))
         model_idx = next((i for i, p in enumerate(self.models) if str(p) == cfg['model']), 0)
         self.model.set_selected(model_idx)
+        precise_idx = next((i for i, (val, _) in enumerate(self.precise_choices) if val == cfg.get('precise_model', '')), 0)
+        self.precise_dd.set_selected(precise_idx)
         dev_target = ('cpu', '') if cfg['device'] == 'cpu' else ('cuda', cfg.get('gpu_uuid', ''))
         dev_idx = next((i for i, d in enumerate(self.devices) if d[:2] == dev_target), 0)
         self.device.set_selected(dev_idx)
@@ -785,9 +826,12 @@ class Settings(Gtk.Application):
         self.say('已还原未保存的更改', 'good')
 
     def hook_dirty(self):
-        for widget in (self.device, self.model, self.compute, self.language, self.mic):
+        for widget in (self.device, self.model, self.compute, self.language, self.mic, self.precise_dd):
             widget.connect('notify::selected', self.mark_dirty)
-        for widget in (self.resident, self.punctuation, self.auto, self.panel, self.preview, self.learning, self.rime):
+        for widget in (
+            self.resident, self.punctuation, self.auto, self.clipboard_fb,
+            self.clean_fillers, self.sound_fb, self.panel, self.preview, self.learning, self.rime,
+        ):
             widget.connect('notify::active', self.mark_dirty)
         self.beam.connect('value-changed', self.mark_dirty)
         self.idle_minutes.connect('value-changed', self.mark_dirty)
@@ -914,10 +958,17 @@ class Settings(Gtk.Application):
         self.modern_grid = Gtk.Grid(column_spacing=12, row_spacing=12, column_homogeneous=True)
         modern_keys = [k for k in MODELS if MODEL_META.get(k, {}).get('group') == 'modern']
         for idx, key in enumerate(modern_keys):
-            card_box, action_btn, bar = self._make_model_card(key)
-            self.model_cards[key] = (card_box, action_btn, bar)
+            card_box, action_btn, del_btn, bar = self._make_model_card(key)
+            self.model_cards[key] = (card_box, action_btn, del_btn, bar)
             self.modern_grid.attach(card_box, idx % 2, idx // 2, 1, 1)
         page.append(self.modern_grid)
+
+        # Inline Live Mic & Speed Test Strip
+        test_card = self.make_card(page, '现场试说测速')
+        self.test_btn = self.ghost('开始试说', self.toggle_voice_test, compact=True)
+        self.test_result = label('点击「开始试说」讲一句，再点停止即可实测识别文本与耗时（不输入到外部窗口）。', 'muted')
+        self.add_row(test_card, '实时麦克风与引擎检验', '使用当前常驻引擎与热词列表进行一次离线测试', self.test_btn)
+        self.add_block(test_card, self.test_result)
 
         # Collapsible Whisper classic models section inside a clean card
         whisper_keys = [k for k in MODELS if MODEL_META.get(k, {}).get('group') == 'whisper']
@@ -1000,9 +1051,15 @@ class Settings(Gtk.Application):
         action_btn.add_css_class('select-pill')
         action_btn.set_valign(Gtk.Align.CENTER)
         action_btn.connect('clicked', lambda _, k=key: self.on_model_action(k))
+        del_btn = Gtk.Button(label='卸载')
+        del_btn.add_css_class('danger-pill')
+        del_btn.set_valign(Gtk.Align.CENTER)
+        del_btn.set_visible(False)
+        del_btn.connect('clicked', lambda _, k=key: self.confirm_uninstall(k))
         top.append(name_lbl)
         top.append(badge)
         top.append(spacer)
+        top.append(del_btn)
         top.append(action_btn)
 
         desc = label(meta['summary'], 'model-desc')
@@ -1025,7 +1082,160 @@ class Settings(Gtk.Application):
         click = Gtk.GestureClick()
         click.connect('released', lambda _g, _n, _x, _y, k=key: self.on_card_clicked(k))
         card.add_controller(click)
-        return card, action_btn, bar
+        return card, action_btn, del_btn, bar
+
+    def confirm_uninstall(self, key):
+        _, path = self._installed_path_for(key)
+        models_root = (Path.home() / '.local/share/qingyin/models').resolve()
+        if path is None or path.resolve().parent != models_root:
+            return
+        if str(path) == str(self._selected_model_path()) or str(path) == self.config.get('model'):
+            self.say('不能卸载当前正在使用的模型，请先切换并保存其他模型', 'warning')
+            return
+        title = MODEL_META.get(key, {}).get('title', key)
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f'卸载本地模型「{title}」？',
+            secondary_text=f'将删除 {path} 以释放硬盘空间，需要时可随时重新下载。',
+        )
+
+        def on_resp(d, resp):
+            if resp == Gtk.ResponseType.OK:
+                try:
+                    shutil.rmtree(path)
+                    previous = str(self._selected_model_path())
+                    self.models = data.models(self.config)
+                    was = self.loading
+                    self.loading = True
+                    self.model.set_model(Gtk.StringList.new([p.name + ' · ' + MODELS.get(p.name, ('', '自定义模型'))[1] for p in self.models]))
+                    self.model.set_selected(next((i for i, p in enumerate(self.models) if str(p) == previous), 0))
+                    self.loading = was
+                    self.sync_model_ui()
+                    self.say(f'已卸载 {title} 并释放硬盘空间 ✓', 'good')
+                except Exception as exc:
+                    self.say(f'卸载失败：{exc}', 'warning')
+            d.destroy()
+
+        dialog.connect('response', on_resp)
+        dialog.present()
+
+    def toggle_voice_test(self, *_):
+        if self.test_recorder is not None:
+            proc = self.test_recorder
+            self.test_recorder = None
+            self.test_btn.set_sensitive(False)
+            self.test_btn.set_label('识别中…')
+            self.test_result.set_text('正在本地识别试说音频…')
+
+            def finish():
+                wav = self.test_wav
+                try:
+                    proc.send_signal(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    t0 = time.perf_counter()
+                    text = self._transcribe_test_wav(wav)
+                    ms = int((time.perf_counter() - t0) * 1000)
+                    GLib.idle_add(self._voice_test_done, text, ms, '')
+                except Exception as exc:
+                    GLib.idle_add(self._voice_test_done, '', 0, str(exc))
+                finally:
+                    if wav:
+                        wav.unlink(missing_ok=True)
+
+            threading.Thread(target=finish, daemon=True).start()
+            return
+
+        rt = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / 'qingyin'
+        rt.mkdir(parents=True, exist_ok=True)
+        self.test_wav = rt / 'settings_test.wav'
+        self.test_wav.unlink(missing_ok=True)
+        cmd = ['pw-record', '--rate', '16000', '--channels', '1', '--format', 's16', '--media-role', 'Communication']
+        mic = self.sources[self.mic.get_selected()][0] if hasattr(self, 'mic') else self.config.get('microphone')
+        if mic:
+            cmd += ['--target', mic]
+        cmd.append(str(self.test_wav))
+        try:
+            self.test_recorder = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.test_btn.set_label('停止并识别')
+            self.test_result.set_text('● 正在录音… 说完一句话后点击「停止并识别」。')
+        except Exception as exc:
+            self.test_result.set_text(f'无法启动试说录音：{exc}')
+
+    def _transcribe_test_wav(self, wav: Path) -> str:
+        model_path = str(self._selected_model_path())
+        device = self.devices[self.device.get_selected()][0]
+        compute = 'int8' if device == 'cpu' else ('int8_float16' if self.compute.get_selected() == 1 else 'float16')
+        job = dict(
+            path=str(wav),
+            language='zh' if self.language.get_selected() == 0 else 'auto',
+            beam_size=self.beam.get_value_as_int(),
+            hotwords=self.get_hotwords_text(),
+            rime_dictionary=False,
+            punctuation=self.punctuation.get_active(),
+            learning=self.learning.get_active(),
+            clean_fillers=self.clean_fillers.get_active(),
+            context='',
+        )
+        sock_path = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / 'qingyin/model.sock'
+        if self.resident.get_active() and sock_path.exists():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(20)
+                s.connect(str(sock_path))
+                hello = dict(
+                    model=model_path,
+                    device=device,
+                    compute=compute,
+                    gpu_uuid=self.config.get('gpu_uuid', ''),
+                    gpu_min_free_mib=self.config.get('gpu_min_free_mib', 6144),
+                    idle_unload_seconds=self.idle_minutes.get_value_as_int() * 60,
+                )
+                s.sendall((json.dumps(hello) + '\n').encode())
+                f = s.makefile('r', encoding='utf-8')
+                ready = json.loads(f.readline())
+                if not ready.get('ready'):
+                    raise RuntimeError(ready.get('error', '模型未就绪'))
+                s.sendall((json.dumps(job) + '\n').encode())
+                reply = json.loads(f.readline())
+                if 'error' in reply:
+                    raise RuntimeError(reply['error'])
+                return reply.get('text', '')
+        root = Path(__file__).resolve().parents[1]
+        proc = subprocess.Popen(
+            [str(root / '.venv/bin/python'), str(root / 'python/asr.py'), model_path, device, compute],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            ready = json.loads(proc.stdout.readline())
+            if not ready.get('ready'):
+                raise RuntimeError(ready.get('error', '模型加载失败'))
+            proc.stdin.write(json.dumps(job, ensure_ascii=False) + '\n')
+            proc.stdin.flush()
+            reply = json.loads(proc.stdout.readline())
+            if 'error' in reply:
+                raise RuntimeError(reply['error'])
+            return reply.get('text', '')
+        finally:
+            proc.kill()
+            proc.wait(timeout=3)
+
+    def _voice_test_done(self, text, ms, error):
+        if self.closed:
+            return False
+        self.test_btn.set_sensitive(True)
+        self.test_btn.set_label('开始试说')
+        if error:
+            self.test_result.set_text(f'试说失败：{error}')
+        elif not text:
+            self.test_result.set_text(f'未检测到有效语音（耗时 {ms} ms），请检查麦克风输入。')
+        else:
+            self.test_result.set_text(f'识别结果（{ms} ms）：{text}')
+        return False
 
     def _installed_path_for(self, key):
         for idx, p in enumerate(self.models):
@@ -1050,7 +1260,7 @@ class Settings(Gtk.Application):
             self.catalog.set_selected(self.catalog_names.index(key))
         card_tuple = self.model_cards.get(key)
         btn = card_tuple[1] if card_tuple else self.whisper_buttons.get(key, self.download_button)
-        bar = card_tuple[2] if card_tuple else self.download_bar
+        bar = card_tuple[3] if card_tuple else self.download_bar
         self.run_download(key, MODEL_META.get(key, {}).get('title', key), btn, self.download_notice, bar,
                           lambda err, k=key, b=btn: self._card_download_done(k, b, err))
 
@@ -1082,6 +1292,26 @@ class Settings(Gtk.Application):
             self.idle_buttons[mins] = b
         self.sync_idle_pills(cur_min)
         self.add_row(mem_card, '空闲自动释放', '超过该时长未语音输入则自动卸载模型并退回 0 MB 内存', seg)
+
+        self.auto_stop_ms = int(self.config.get('auto_stop_silence_ms', 0))
+        auto_seg = hbox(2)
+        auto_seg.add_css_class('seg-group')
+        for ms, text in AUTO_STOP_PRESETS:
+            b = Gtk.Button(label=text)
+            b.add_css_class('seg')
+            b.connect('clicked', lambda _, val=ms: self.set_auto_stop_ms(val))
+            auto_seg.append(b)
+            self.auto_stop_buttons[ms] = b
+        self.sync_auto_stop_pills(self.auto_stop_ms)
+        self.add_row(mem_card, '说完自动停录', '检测到说话结束并静音达到该时长时自动提交（无需再按第二次 Win+A）', auto_seg)
+
+        self.precise_choices = [('', '自动（优先 Fun-ASR-Nano / Qwen3-ASR）')]
+        for p in self.models:
+            self.precise_choices.append((str(p), MODEL_META.get(p.name, {}).get('title', p.name)))
+        self.precise_dd = Gtk.DropDown.new_from_strings([lbl for _, lbl in self.precise_choices])
+        cur_precise = self.config.get('precise_model', '')
+        self.precise_dd.set_selected(next((i for i, (v, _) in enumerate(self.precise_choices) if v == cur_precise), 0))
+        self.add_row(mem_card, '高精语义备选模型（Win+Shift+A）', '单次按需运行高精度 LLM-ASR，用完即释且不驱逐常驻极速引擎', self.precise_dd)
 
         # Live preview card
         prev_card = self.make_card(page, '实时预览')
@@ -1150,6 +1380,21 @@ class Settings(Gtk.Application):
             else:
                 btn.remove_css_class('active')
 
+    def set_auto_stop_ms(self, ms):
+        if self.auto_stop_ms != ms:
+            self.auto_stop_ms = ms
+            self.sync_auto_stop_pills(ms)
+            self.mark_dirty()
+        else:
+            self.sync_auto_stop_pills(ms)
+
+    def sync_auto_stop_pills(self, ms):
+        for val, btn in self.auto_stop_buttons.items():
+            if val == ms:
+                btn.add_css_class('active')
+            else:
+                btn.remove_css_class('active')
+
     # --- Page 3: Output & Vocabulary ------------------------------------
     def build_output_page(self):
         page = self.make_page('output', '文字与词库', '自定义输出排版、个人纠错词库与中英专有热词。')
@@ -1176,8 +1421,14 @@ class Settings(Gtk.Application):
         self.auto = Gtk.Switch(active=self.config.get('auto_input', True))
         self.add_row(out_card, '自动输入当前文本框', '通过原生 fcitx5 插件直出；关闭后可用 qingyin copy 复制', self.auto)
 
+        self.clipboard_fb = Gtk.Switch(active=self.config.get('clipboard_fallback', True))
+        self.add_row(out_card, '非输入法窗口自动复制', '遇到未连接 fcitx5 的特殊窗口自动复制到剪贴板（密码框始终跳过）', self.clipboard_fb)
+
+        self.clean_fillers = Gtk.Switch(active=self.config.get('clean_fillers', False))
+        self.add_row(out_card, '口语语气词清理', '自动去掉句首与句间停顿处的「呃、嗯、那个」等口癖词', self.clean_fillers)
+
         self.panel = Gtk.Switch(active=self.config.get('show_panel', False))
-        self.add_row(out_card, '悬浮状态窗', '录音与转写期间显示迷你波形浮窗（不抢占输入框焦点）', self.panel)
+        self.add_row(out_card, '灵动岛状态浮窗', '录音与转写期间顶部浮现迷你黑曜石波形岛（绝不抢占输入框焦点）', self.panel)
 
         vocab_card = self.make_card(page, '词库与热词增强')
         total_rules, active_rules = data.learning_stats()
@@ -1260,10 +1511,13 @@ class Settings(Gtk.Application):
         mic_row.append(self.mic)
         mic_row.append(self.ghost('刷新麦克风', self.refresh_microphones, compact=True))
         self.add_block(mic_card, mic_row, label('优先使用内置阵列或 USB 麦克风；蓝牙通话模式可能导致采样率下降。', 'muted'))
+        self.sound_fb = Gtk.Switch(active=self.config.get('sound_feedback', True))
+        self.add_row(mic_card, '轻量提示音反馈', '开始录音与停止转写时播放 35 ms 极轻清脆滴答声（不开浮窗也能确认状态）', self.sound_fb)
 
         kbd_card = self.make_card(page, '全局快捷键（niri）')
         shortcuts = [
-            ('开始录音 / 停止并转写', '按一下开始说话，再按一下瞬间上屏', ['Win', 'A']),
+            ('开始录音 / 停止并转写', '极速引擎瞬间上屏（约 0.2 秒）', ['Win', 'A']),
+            ('高精语义模式（单次按需）', '调用 LLM-ASR 精准语义纠错，用完立刻释放内存', ['Win', 'Shift', 'A']),
             ('取消当前录音或转写', '立即丢弃录音并释放识别请求', ['Win', 'Alt', 'Esc']),
             ('纠正上一条结果', '快速修正错字并教给个人词库', ['Win', 'Alt', 'A']),
         ]
@@ -1390,9 +1644,12 @@ class Settings(Gtk.Application):
         spec = sherpa_engine.detect_model(p)
 
         # Update modern 2-col cards
-        for key, (card, btn, _bar) in self.model_cards.items():
-            idx, _ = self._installed_path_for(key)
+        models_root = (Path.home() / '.local/share/qingyin/models').resolve()
+        for key, (card, btn, del_btn, _bar) in self.model_cards.items():
+            idx, mpath = self._installed_path_for(key)
             is_sel = key == cur_name
+            can_del = (not is_sel) and mpath is not None and mpath.resolve().parent == models_root
+            del_btn.set_visible(can_del)
             if is_sel:
                 card.add_css_class('selected')
                 btn.add_css_class('selected')
@@ -1632,6 +1889,8 @@ class Settings(Gtk.Application):
                 dict(
                     resident_model=self.resident.get_active(),
                     idle_unload_seconds=self.idle_minutes.get_value_as_int() * 60,
+                    auto_stop_silence_ms=self.auto_stop_ms,
+                    precise_model=self.precise_choices[self.precise_dd.get_selected()][0],
                     device=device,
                     gpu_uuid=uuid,
                     model=str(model),
@@ -1642,6 +1901,9 @@ class Settings(Gtk.Application):
                     punctuation=self.punctuation.get_active(),
                     learning=self.learning.get_active(),
                     auto_input=self.auto.get_active(),
+                    clipboard_fallback=self.clipboard_fb.get_active(),
+                    clean_fillers=self.clean_fillers.get_active(),
+                    sound_feedback=self.sound_fb.get_active(),
                     show_panel=self.panel.get_active(),
                     live_preview=self.preview.get_active(),
                     microphone=self.sources[self.mic.get_selected()][0],

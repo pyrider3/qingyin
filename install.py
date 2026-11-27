@@ -102,6 +102,7 @@ if 'Qingyin local dictation' not in s:
  s=s.replace('binds {',f'''binds {{
     // Qingyin local dictation: press once to start, once to stop.
     Mod+A repeat=false {{ spawn "{launcher}" "toggle"; }}
+    Mod+Shift+A repeat=false {{ spawn "{launcher}" "toggle" "--precise"; }}
     Mod+Alt+A repeat=false {{ spawn "{launcher}" "edit"; }}
     Mod+Alt+Escape repeat=false {{ spawn "{launcher}" "cancel"; }}''',1)
  s+='''

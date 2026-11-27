@@ -243,24 +243,149 @@ def _can_encode_sp(spaced: str, token_set: set[str]) -> bool:
     return True
 
 
+def bucket_hotwords(manual: str, learned: str, rime: str, limit: int = 96) -> list[str]:
+    """Allocate dedicated slots so context hints, learned terms, and manual hotwords never starve each other."""
+    rime_list = _split_phrases(rime)[:16]
+    learned_list = _split_phrases(learned)[:16]
+    manual_list = _split_phrases(manual)
+    # Priority: immediate textbox context -> repeated personal terms -> user manual list.
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in (rime_list, learned_list, manual_list):
+        for term in group:
+            key = term.casefold()
+            if key not in seen:
+                seen.add(key)
+                merged.append(term)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
 def format_transducer_hotwords(phrases: list[str], token_set: set[str], is_sentencepiece: bool,
-                               limit: int = 48, score: float = 2.0) -> str:
+                               limit: int = 96, score: float = 2.0) -> str:
     """Format hotwords for sherpa-onnx Transducer modified_beam_search, skipping OOV entries."""
     lines = []
+    seen = set()
     for phrase in phrases:
-        if is_sentencepiece:
-            # Separate every CJK character so SentencePiece attaches ▁ to each character.
-            spaced = ' '.join(re.sub(r'([\u4e00-\u9fff])', r' \1 ', phrase).split())
-            if not _can_encode_sp(spaced, token_set):
-                continue
-            lines.append(f'{spaced} :{score:g}')
-        else:
-            if not all((ch in token_set) for ch in phrase if not ch.isspace()):
-                continue
-            lines.append(f'{phrase} :{score:g}')
+        candidates = [phrase]
+        # If an ASCII term contains digits (e.g. fcitx5, RTX 5080), also boost its alphabetic stem
+        # so the transducer favors the English prefix before post-ASR digit normalization.
+        if is_sentencepiece and phrase.isascii() and any(c.isdigit() for c in phrase):
+            stem = ' '.join(re.findall(r'[A-Za-z]{2,}', phrase))
+            if stem:
+                candidates.append(stem)
+        for cand in candidates:
+            if is_sentencepiece:
+                spaced = ' '.join(re.sub(r'([\u4e00-\u9fff])', r' \1 ', cand).split())
+                if not _can_encode_sp(spaced, token_set):
+                    continue
+                entry = f'{spaced} :{score:g}'
+            else:
+                if not all((ch in token_set) for ch in cand if not ch.isspace()):
+                    continue
+                entry = f'{cand} :{score:g}'
+            if entry not in seen:
+                seen.add(entry)
+                lines.append(entry)
+                break
         if len(lines) >= limit:
             break
     return '\n'.join(lines)
+
+
+def _vad_model_path() -> Path:
+    base = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
+    return base / 'qingyin/vad/silero_vad.onnx'
+
+
+def build_vad():
+    path = _vad_model_path()
+    if not path.is_file():
+        return None
+    try:
+        import sherpa_onnx
+        cfg = sherpa_onnx.VadModelConfig()
+        cfg.silero_vad.model = str(path)
+        cfg.silero_vad.threshold = 0.42
+        cfg.silero_vad.min_silence_duration = 0.45
+        cfg.silero_vad.min_speech_duration = 0.12
+        cfg.silero_vad.window_size = 512
+        cfg.sample_rate = 16000
+        return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=120)
+    except Exception as exc:
+        print(f'VAD 加载跳过：{exc}', file=sys.stderr, flush=True)
+        return None
+
+
+def trim_silence(samples, vad=None, rate: int = 16000):
+    """Trim dead silence using Silero VAD (or fast RMS fallback) while preserving speech padding."""
+    import numpy as np
+
+    if len(samples) < int(rate * 0.6):
+        return samples
+
+    if vad is not None:
+        try:
+            vad.reset()
+            win = 512
+            segments = []
+            for start in range(0, len(samples), win):
+                chunk = samples[start:start + win]
+                if len(chunk) < win:
+                    padded = np.zeros(win, dtype=np.float32)
+                    padded[:len(chunk)] = chunk
+                    chunk = padded
+                vad.accept_waveform(chunk)
+                while not vad.empty():
+                    seg = vad.front
+                    segments.append((seg.start, seg.start + len(seg.samples)))
+                    vad.pop()
+            vad.flush()
+            while not vad.empty():
+                seg = vad.front
+                segments.append((seg.start, seg.start + len(seg.samples)))
+                vad.pop()
+            if not segments:
+                return samples  # Never drop quiet speech completely.
+            pad = int(rate * 0.16)
+            merged = []
+            for s, e in segments:
+                s = max(0, s - pad)
+                e = min(len(samples), e + pad)
+                if merged and s <= merged[-1][1] + int(rate * 0.35):
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+            spacer = np.zeros(int(rate * 0.18), dtype=np.float32)
+            parts = []
+            for idx, (s, e) in enumerate(merged):
+                if idx > 0:
+                    parts.append(spacer)
+                parts.append(samples[s:e])
+            trimmed = np.concatenate(parts)
+            return trimmed if len(trimmed) >= int(rate * 0.2) else samples
+        except Exception:
+            pass
+
+    # Lightweight zero-model RMS edge trim fallback.
+    frame = int(rate * 0.02)
+    n_frames = len(samples) // frame
+    if n_frames <= 10:
+        return samples
+    blocks = samples[:n_frames * frame].reshape(n_frames, frame)
+    rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    peak = float(np.max(rms)) if len(rms) else 0.0
+    if peak < 0.005:
+        return samples
+    thresh = max(0.004, peak * 0.06)
+    voiced = np.where(rms >= thresh)[0]
+    if len(voiced) == 0:
+        return samples
+    pad_frames = 10  # 200ms padding
+    lo = max(0, int(voiced[0]) - pad_frames) * frame
+    hi = min(len(samples), (int(voiced[-1]) + pad_frames + 1) * frame)
+    return samples[lo:hi]
 
 
 def _cpu_threads(kind: str) -> int:
@@ -347,7 +472,7 @@ def build_recognizer(spec: dict, model_dir: Path):
 
 
 def serve(model_dir, run=None):
-    from normalize import clean_spacing, simplified, without_final_period
+    from normalize import apply_alnum_hotwords, clean_fillers, clean_spacing, simplified, without_final_period
     from punctuation import restore
     import learning
     import rime_dictionary
@@ -364,16 +489,18 @@ def serve(model_dir, run=None):
         print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
         sys.exit(1)
 
+    vad = build_vad()
     kind = spec['kind']
     print(json.dumps({'ready': True, 'device': 'cpu'}), flush=True)
     for line in sys.stdin:
-        request = samples = vocabulary = context = dict_hints = phrases = stream = text = None
+        request = samples = vocabulary = context = dict_hints = phrases = manual_phrases = stream = text = None
         try:
             request = json.loads(line)
             samples = load_audio(request['path'], run=run or subprocess.run)
             if len(samples) == 0:
                 print(json.dumps({'text': ''}, ensure_ascii=False), flush=True)
                 continue
+            samples = trim_silence(samples, vad=vad)
 
             vocabulary = {'rules': []}
             if request.get('learning', True):
@@ -390,20 +517,19 @@ def serve(model_dir, run=None):
                 except Exception as exc:
                     print(f'雾凇词库读取失败，保留原识别：{exc}', file=sys.stderr, flush=True)
 
-            phrases = _split_phrases(
-                request.get('hotwords', ''),
-                learning.hints(vocabulary) if request.get('learning', True) else '',
-                dict_hints,
-            )
+            manual_raw = request.get('hotwords', '')
+            manual_phrases = _split_phrases(manual_raw)
+            learned_raw = learning.hints(vocabulary, min_count=2) if request.get('learning', True) else ''
+            phrases = bucket_hotwords(manual_raw, learned_raw, dict_hints, limit=96)
 
             if kind == 'transducer':
-                hw = format_transducer_hotwords(phrases, spec['token_set'], spec['is_sentencepiece'])
+                hw = format_transducer_hotwords(phrases, spec['token_set'], spec['is_sentencepiece'], limit=96)
                 stream = recognizer.create_stream(hotwords=hw) if hw else recognizer.create_stream()
             else:
                 stream = recognizer.create_stream()
                 if kind == 'funasr-nano':
                     if phrases:
-                        stream.set_option('hotwords', ','.join(phrases[:48]))
+                        stream.set_option('hotwords', ','.join(phrases[:64]))
                     stream.set_option('itn', '1')
                     lang = request.get('language', 'zh')
                     if lang == 'zh':
@@ -412,12 +538,16 @@ def serve(model_dir, run=None):
                         stream.set_option('user_prompt', f'前文：{context[-120:]}\n语音转写：')
                 elif kind == 'qwen3-asr':
                     if phrases:
-                        stream.set_option('hotwords', ','.join(phrases[:48]))
+                        # Qwen3-ASR shares a 512-token prompt+audio KV budget; keep hotwords concise.
+                        stream.set_option('hotwords', ','.join(phrases[:24]))
 
             stream.accept_waveform(16000, samples)
             recognizer.decode_stream(stream)
             text = clean_spacing(simplified(stream.result.text.strip()))
+            text = apply_alnum_hotwords(text, manual_phrases)
             text = learning.apply(text, vocabulary)
+            if request.get('clean_fillers', False):
+                text = clean_fillers(text)
 
             if request.get('punctuation', True) and not spec['native_punctuation']:
                 try:
@@ -429,4 +559,4 @@ def serve(model_dir, run=None):
             print(f'转写失败：{exc}', file=sys.stderr, flush=True)
             print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
         finally:
-            request = samples = vocabulary = context = dict_hints = phrases = stream = text = line = None
+            request = samples = vocabulary = context = dict_hints = phrases = manual_phrases = stream = text = line = None

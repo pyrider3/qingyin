@@ -7,6 +7,7 @@ import socket
 import tempfile
 import time
 import learning
+import phonetics
 
 PREFIX = '\x1fqingyin:'
 
@@ -32,7 +33,7 @@ def auto_pairs(before, after):
         # Allow a standalone Chinese-name -> English-name correction only.
         if not (before.isalpha() and after.isascii() and after.isalpha() and len(before)<=12 and len(after)<=24):
             return []
-    return learning.propose(before,after)
+    return [(s, t) for s, t in learning.propose(before, after) if phonetics.is_phonetic_match(s, t)]
 
 def run():
     deadline=time.monotonic()+60

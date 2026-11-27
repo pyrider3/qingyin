@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::Shutdown,
     os::unix::{
         fs::PermissionsExt,
@@ -15,7 +15,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 #[derive(Clone, Deserialize, Serialize)]
 struct Config {
@@ -49,6 +49,16 @@ struct Config {
     gpu_min_free_mib: u64,
     #[serde(default = "default_idle_unload")]
     idle_unload_seconds: u64,
+    #[serde(default)]
+    auto_stop_silence_ms: u64,
+    #[serde(default = "default_punctuation")]
+    sound_feedback: bool,
+    #[serde(default = "default_punctuation")]
+    clipboard_fallback: bool,
+    #[serde(default)]
+    clean_fillers: bool,
+    #[serde(default)]
+    precise_model: String,
 }
 fn default_punctuation() -> bool {
     true
@@ -177,7 +187,7 @@ impl Worker {
                     writeln!(
                         stream,
                         "{}",
-                        json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"rime_dictionary":c.rime_dictionary,"punctuation":c.punctuation,"learning":c.learning,"context":context})
+                        json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"rime_dictionary":c.rime_dictionary,"punctuation":c.punctuation,"learning":c.learning,"clean_fillers":c.clean_fillers,"context":context})
                     )?;
                     stream.flush()?;
                     let v = worker_reply(&mut output)?;
@@ -222,7 +232,7 @@ impl Worker {
                 writeln!(
                     input,
                     "{}",
-                    json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"rime_dictionary":c.rime_dictionary,"punctuation":c.punctuation,"learning":c.learning,"context":context})
+                    json!({"path":path,"language":c.language,"beam_size":c.beam_size,"hotwords":c.hotwords,"rime_dictionary":c.rime_dictionary,"punctuation":c.punctuation,"learning":c.learning,"clean_fillers":c.clean_fillers,"context":context})
                 )?;
                 input.flush()?;
                 let v = worker_reply(&mut output)?;
@@ -672,13 +682,157 @@ fn status_json(state: &State, running: bool) -> String {
     v["running"] = json!(running);
     v.to_string()
 }
-fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
+fn write_chime_wav(path: &Path, freqs: &[f32], dur_ms: u32) -> io::Result<()> {
+    let sr: u32 = 16000;
+    let total = (sr * dur_ms / 1000) as usize;
+    let seg = (total / freqs.len().max(1)).max(1);
+    let mut pcm = Vec::with_capacity(total * 2);
+    for i in 0..total {
+        let f = freqs[(i / seg).min(freqs.len() - 1)];
+        let t = i as f32 / sr as f32;
+        let phase = (i as f32) / (total as f32);
+        // Smooth Hann envelope so chimes have zero clicks.
+        let env = 0.5 * (1.0 - (std::f32::consts::TAU * phase).cos());
+        let sample = ((std::f32::consts::TAU * f * t).sin() * env * 9000.0) as i16;
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    let data_len = pcm.len() as u32;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sr.to_le_bytes());
+    wav.extend_from_slice(&(sr * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    fs::write(path, wav)
+}
+fn play_chime(rt: &Path, start: bool) {
+    let dir = rt.join("sfx");
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join(if start {
+        "chime_start.wav"
+    } else {
+        "chime_stop.wav"
+    });
+    if !file.is_file() {
+        let _ = if start {
+            write_chime_wav(&file, &[659.25, 880.0], 42)
+        } else {
+            write_chime_wav(&file, &[587.33], 30)
+        };
+    }
+    let _ = Command::new("pw-play")
+        .args(["--volume", "0.35", "--media-role", "Notification"])
+        .arg(&file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+fn allow_clipboard_fallback(reason: &str, cfg: &Config) -> bool {
+    !reason.contains("密码或敏感") && cfg.auto_input && cfg.clipboard_fallback
+}
+struct SilenceTracker {
+    pos: u64,
+    noise_floor: f32,
+    speech_ms: u64,
+    silence_ms: u64,
+    last_check: Instant,
+}
+impl SilenceTracker {
+    fn new() -> Self {
+        Self {
+            pos: 44,
+            noise_floor: 0.008,
+            speech_ms: 0,
+            silence_ms: 0,
+            last_check: Instant::now(),
+        }
+    }
+    fn should_stop(&mut self, wav_path: &Path, limit_ms: u64) -> bool {
+        if limit_ms == 0 || self.last_check.elapsed() < Duration::from_millis(60) {
+            return false;
+        }
+        self.last_check = Instant::now();
+        let Ok(mut file) = fs::File::open(wav_path) else {
+            return false;
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return false;
+        };
+        if len <= self.pos + 640 {
+            return false;
+        }
+        let avail = ((len - self.pos) & !1).min(32000) as usize;
+        if file.seek(SeekFrom::Start(self.pos)).is_err() {
+            return false;
+        }
+        let mut buf = vec![0u8; avail];
+        if file.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        self.pos += avail as u64;
+        // Analyze in 20ms (320-sample = 640-byte) frames.
+        for frame in buf.as_chunks::<640>().0 {
+            let mut sum_sq = 0.0f32;
+            for sample in frame.as_chunks::<2>().0 {
+                let v = i16::from_le_bytes(*sample) as f32 / 32768.0;
+                sum_sq += v * v;
+            }
+            let rms = (sum_sq / 320.0).sqrt();
+            let threshold = (self.noise_floor * 2.8).max(0.015);
+            if rms >= threshold {
+                self.speech_ms += 20;
+                self.silence_ms = 0;
+            } else {
+                // Slowly track ambient noise floor on quiet frames.
+                self.noise_floor = (self.noise_floor * 0.96 + rms * 0.04).clamp(0.003, 0.03);
+                if self.speech_ms >= 240 {
+                    self.silence_ms += 20;
+                }
+            }
+        }
+        self.speech_ms >= 240 && self.silence_ms >= limit_ms
+    }
+}
+fn resolve_precise_model(cfg: &Config) -> Option<String> {
+    if !cfg.precise_model.is_empty() && Path::new(&cfg.precise_model).is_dir() {
+        return Some(cfg.precise_model.clone());
+    }
+    let models_dir =
+        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/qingyin/models");
+    for name in ["funasr-nano", "qwen3-asr-0.6b"] {
+        let cand = models_dir.join(name);
+        if cand.is_dir() && cand.to_string_lossy() != cfg.model {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+fn daemon(home: PathBuf, mut cfg: Config, cli_precise: bool) -> io::Result<()> {
     let rt = runtime();
     fs::create_dir_all(&rt)?;
     fs::set_permissions(&rt, fs::Permissions::from_mode(0o700))?;
     let socket = rt.join("control.sock");
     if UnixStream::connect(&socket).is_ok() {
         return Ok(());
+    }
+    let precise_flag = rt.join("precise.flag");
+    let precise = cli_precise || precise_flag.exists();
+    let _ = fs::remove_file(&precise_flag);
+    if precise && let Some(model_path) = resolve_precise_model(&cfg) {
+        cfg.model = model_path;
+        cfg.device = "cpu".into();
+        // Run high-precision LLM-ASR one-shot so we never evict the warm X-ASR resident worker.
+        cfg.resident_model = false;
+        cfg.live_preview = false;
     }
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
@@ -693,15 +847,23 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
     let state = Arc::new(Mutex::new(idle_state()));
     let target = focused();
     let mut target_context = String::new();
+    let mut silence = SilenceTracker::new();
     // Record before model initialization so speech at the first key press is preserved.
     let startup = (|| -> io::Result<()> {
         let wav_path = rt.join("recording.wav");
         session.recorder = Some(start_record(&cfg, &wav_path)?);
+        if cfg.sound_feedback {
+            play_chime(&rt, true);
+        }
         set_state(
             &state,
             &path,
             "recording",
-            "再按 Win+A 停止 · Win+Alt+Esc 取消",
+            if precise {
+                "高精语义模式录音中 · 再按停止 · Win+Alt+Esc 取消"
+            } else {
+                "再按 Win+A 停止 · Win+Alt+Esc 取消"
+            },
             "",
         );
         let snapshot = context_snapshot(&rt).unwrap_or(Value::Null);
@@ -744,6 +906,9 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                 let reply = match cmd.trim() {
                     "status" => status_json(&state.lock().unwrap(), true),
                     "toggle" if session.recorder.is_some() => {
+                        if cfg.sound_feedback {
+                            play_chime(&rt, false);
+                        }
                         if let Err(e) = stop_and_transcribe(&mut session, &state, &path) {
                             set_state(&state, &path, "error", &chinese_error(&e), "");
                             exit = true;
@@ -841,8 +1006,13 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                         }
                         Err(reason) => {
                             eprintln!("青音自动输入：{reason}");
-                            let message =
-                                format!("{reason}。结果已保留，运行 qingyin copy 后粘贴。");
+                            let copied =
+                                allow_clipboard_fallback(&reason, &cfg) && clipboard(&text).is_ok();
+                            let message = if copied {
+                                format!("{reason}。已自动复制到剪贴板，按 Ctrl+V 即可粘贴。")
+                            } else {
+                                format!("{reason}。结果已保留，运行 qingyin copy 后粘贴。")
+                            };
                             if !cfg.show_panel {
                                 notify(&message);
                             }
@@ -873,15 +1043,22 @@ fn daemon(home: PathBuf, cfg: Config) -> io::Result<()> {
                 return Ok(());
             }
             let expired = now() - state.lock().unwrap().started >= cfg.max_seconds as f64;
-            if expired && let Err(e) = stop_and_transcribe(&mut session, &state, &path) {
-                set_state(&state, &path, "error", &chinese_error(&e), "");
-                return Ok(());
+            let auto_stopped = cfg.auto_stop_silence_ms > 0
+                && silence.should_stop(&rt.join("recording.wav"), cfg.auto_stop_silence_ms);
+            if expired || auto_stopped {
+                if cfg.sound_feedback {
+                    play_chime(&rt, false);
+                }
+                if let Err(e) = stop_and_transcribe(&mut session, &state, &path) {
+                    set_state(&state, &path, "error", &chinese_error(&e), "");
+                    return Ok(());
+                }
             }
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
-fn toggle() -> io::Result<String> {
+fn toggle(precise: bool) -> io::Result<String> {
     let rt = runtime();
     fs::create_dir_all(&rt)?;
     fs::set_permissions(&rt, fs::Permissions::from_mode(0o700))?;
@@ -895,10 +1072,17 @@ fn toggle() -> io::Result<String> {
     if let Ok(reply) = request("toggle") {
         return Ok(reply);
     }
+    let flag = rt.join("precise.flag");
+    if precise {
+        let _ = fs::write(&flag, b"1");
+    } else {
+        let _ = fs::remove_file(&flag);
+    }
     let result = Command::new("systemctl")
         .args(["--user", "start", "qingyin.service"])
         .output()?;
     if !result.status.success() {
+        let _ = fs::remove_file(&flag);
         return Err(io::Error::other(
             String::from_utf8_lossy(&result.stderr).to_string(),
         ));
@@ -907,7 +1091,11 @@ fn toggle() -> io::Result<String> {
         if let Ok(reply) = request("status") {
             let v: Value = serde_json::from_str(&reply).map_err(io::Error::other)?;
             return Ok(if v["phase"] == "recording" {
-                "开始录音（按需启动）".into()
+                if precise {
+                    "开始录音（高精语义模式）".into()
+                } else {
+                    "开始录音（按需启动）".into()
+                }
             } else {
                 reply
             });
@@ -925,6 +1113,7 @@ fn run() -> io::Result<()> {
     let cfg_path = PathBuf::from(env::var("HOME").unwrap()).join(".config/qingyin/config.json");
     let args: Vec<String> = env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("toggle");
+    let precise = args.iter().skip(2).any(|a| a == "--precise");
     if matches!(cmd, "cancel" | "quit") {
         cancel_context_watch();
     }
@@ -961,11 +1150,12 @@ fn run() -> io::Result<()> {
         "daemon" | "session" => {
             let cfg: Config =
                 serde_json::from_slice(&fs::read(cfg_path)?).map_err(io::Error::other)?;
-            return daemon(home, cfg);
+            return daemon(home, cfg, precise);
         }
         "cleanup" => {
             let _ = fs::remove_file(runtime().join("recording.wav"));
             let _ = fs::remove_file(runtime().join("control.sock"));
+            let _ = fs::remove_file(runtime().join("precise.flag"));
             let state = saved_state();
             if matches!(
                 state.phase.as_str(),
@@ -975,7 +1165,7 @@ fn run() -> io::Result<()> {
             }
             "已清理".into()
         }
-        "toggle" => toggle()?,
+        "toggle" => toggle(precise)?,
         "show" => show_panel(&home)?,
         "copy" => {
             let text = saved_state().text;
@@ -1056,5 +1246,58 @@ mod tests {
             assert!(chinese_error(&error).contains("识别进程"));
         }
         assert!(chinese_error(&io::Error::other("unknown backend exception")).contains("日志"));
+    }
+    #[test]
+    fn clipboard_fallback_never_fires_for_sensitive_fields() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"model":"x","device":"cpu","language":"zh","auto_input":true,"microphone":null,"max_seconds":60,"clipboard_fallback":true}"#,
+        )
+        .unwrap();
+        assert!(allow_clipboard_fallback("输入法未连接当前文本框", &cfg));
+        assert!(!allow_clipboard_fallback(
+            "当前是密码或敏感输入框，已停止自动输入",
+            &cfg
+        ));
+        let mut off = cfg.clone();
+        off.clipboard_fallback = false;
+        assert!(!allow_clipboard_fallback("输入法未连接当前文本框", &off));
+    }
+    #[test]
+    fn silence_tracker_stops_only_after_speech_then_silence() {
+        let dir = env::temp_dir().join(format!("qingyin-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let wav = dir.join("probe.wav");
+        // Write 44-byte header + 300ms silence -> should not stop (no speech yet).
+        let mut data = vec![0u8; 44 + 15 * 640];
+        fs::write(&wav, &data).unwrap();
+        let mut tracker = SilenceTracker::new();
+        tracker.last_check = Instant::now() - Duration::from_secs(1);
+        assert!(!tracker.should_stop(&wav, 400));
+        // Append 320ms speech (16 frames of loud square wave) -> should not stop while speaking.
+        for _ in 0..(16 * 320) {
+            data.extend_from_slice(&12000i16.to_le_bytes());
+        }
+        fs::write(&wav, &data).unwrap();
+        tracker.last_check = Instant::now() - Duration::from_secs(1);
+        assert!(!tracker.should_stop(&wav, 400));
+        // Append 440ms silence (22 frames) -> should trigger auto-stop!
+        data.resize(data.len() + 22 * 640, 0);
+        fs::write(&wav, &data).unwrap();
+        tracker.last_check = Instant::now() - Duration::from_secs(1);
+        assert!(tracker.should_stop(&wav, 400));
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn chime_wav_has_valid_header_and_size() {
+        let dir = env::temp_dir().join(format!("qingyin-chime-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let wav = dir.join("chime.wav");
+        write_chime_wav(&wav, &[659.25, 880.0], 40).unwrap();
+        let bytes = fs::read(&wav).unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        // 16000 Hz * 0.04s = 640 samples = 1280 bytes + 44 header
+        assert_eq!(bytes.len(), 44 + 1280);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -70,7 +70,7 @@ def propose(before, after):
             pairs.append(pair)
     return pairs
 
-def record(pairs, event, path=None):
+def record(pairs, event, path=None, promote_now=False):
     def action(data):
         added = 0
         for source, target in pairs:
@@ -78,14 +78,45 @@ def record(pairs, event, path=None):
             row = next((r for r in data['rules'] if r['id'] == key), None)
             if row is None:
                 if len(data['rules']) >= LIMIT:
-                    raise ValueError('个人词库已达 256 条，请先删除不需要的记录')
+                    # Auto-evict the oldest unconfirmed (count==1) candidate before failing.
+                    evict_idx = next((i for i, r in enumerate(data['rules']) if r.get('count', 0) <= 1), None)
+                    if evict_idx is None:
+                        raise ValueError('个人词库已达 256 条已确认规则，请先删除不需要的记录')
+                    data['rules'].pop(evict_idx)
                 row = {'id': key, 'source': source, 'target': target, 'count': 0, 'events': []}
                 data['rules'].append(row)
             if event not in row['events']:
                 row['count'] += 1
                 row['events'] = (row['events']+[event])[-32:]
                 added += 1
+            if promote_now and row['count'] < THRESHOLD:
+                row['count'] = THRESHOLD
         return added
+    return mutate(action, path)
+
+
+def promote(rule_id, path=None):
+    """Immediately activate a candidate rule by raising its confirmation count to THRESHOLD."""
+    def action(data):
+        for row in data['rules']:
+            if row['id'] == rule_id:
+                row['count'] = max(row.get('count', 0), THRESHOLD)
+                return True
+        return False
+    return mutate(action, path)
+
+
+def prune_noise(path=None):
+    """Remove unconfirmed candidate rules that are not phonetically similar."""
+    import phonetics
+
+    def action(data):
+        before = len(data['rules'])
+        data['rules'] = [
+            r for r in data['rules']
+            if r.get('count', 0) >= THRESHOLD or phonetics.is_phonetic_match(r['source'], r['target'])
+        ]
+        return before - len(data['rules'])
     return mutate(action, path)
 
 def active_rules(data):
@@ -109,8 +140,10 @@ def apply(text, data):
         lookup[key] = row['target']
     return re.sub('|'.join(parts), lambda m: lookup[m.lastgroup], text)
 
-def hints(data):
-    targets = list(dict.fromkeys(r['target'] for r in sorted(data['rules'], key=lambda r:r['count'], reverse=True)))
+def hints(data, min_count=1):
+    rules = [r for r in data['rules'] if r.get('count', 0) >= min_count]
+    ranked = sorted(rules, key=lambda r: (r.get('count', 0) >= THRESHOLD, r.get('count', 0)), reverse=True)
+    targets = list(dict.fromkeys(r['target'] for r in ranked))
     return ', '.join(targets[:64])[:512]
 
 def delete(rule_id=None, path=None):

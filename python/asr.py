@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from audio_io import load_audio
 from gpu_policy import prepare_cuda
-from normalize import clean_spacing, simplified, without_final_period
+from normalize import apply_alnum_hotwords, clean_fillers, clean_spacing, simplified, without_final_period
 from punctuation import restore_isolated
 import learning
 import rime_dictionary
@@ -57,7 +57,10 @@ for line in sys.stdin:
                                          hotwords=hotwords or None,
                                          initial_prompt=context or None)
         text = clean_spacing(simplified("".join(s.text for s in segments).strip()))
+        text = apply_alnum_hotwords(text, sherpa_engine._split_phrases(request.get('hotwords', '')))
         text = learning.apply(text, vocabulary)
+        if request.get('clean_fillers', False):
+            text = clean_fillers(text)
         if request.get("punctuation", True):
             try:
                 text = restore_isolated(text)
